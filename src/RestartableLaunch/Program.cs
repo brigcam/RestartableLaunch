@@ -1293,11 +1293,11 @@ internal static partial class Program
             try
             {
                 var existingWindows = GetTopLevelWindowHandles();
-                var startedAt = DateTimeOffset.Now;
                 var process = request.Kind == LaunchKind.DefaultOpen
                     ? StartDefaultOpen(request.Executable)
                     : StartExecutable(request);
                 process.EnableRaisingEvents = true;
+                var startedAt = TryGetProcessStartedAt(process) ?? DateTimeOffset.Now;
 
                 var app = new MonitoredApp(request, process, startedAt, null, null, ruleId);
                 apps.Add(app);
@@ -1446,12 +1446,26 @@ internal static partial class Program
                 monitorRules.Clear();
                 monitorRules.AddRange(session.Rules ?? []);
 
+                var restoredRuleBackedCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var savedApp in session.Apps)
                 {
-                    if (!TryAdoptSavedApp(savedApp))
+                    if (TryAdoptSavedApp(savedApp))
                     {
-                        Launch(savedApp.ToLaunchRequest(), savedApp.RuleId);
+                        if (savedApp.RuleId is not null)
+                        {
+                            restoredRuleBackedCommands.Add(GetSavedAppRestartKey(savedApp));
+                        }
+
+                        continue;
                     }
+
+                    if (savedApp.RuleId is not null && !restoredRuleBackedCommands.Add(GetSavedAppRestartKey(savedApp)))
+                    {
+                        LogMessage("restore-deduplicate", $"Skipped duplicate saved app: {FormatRequest(savedApp.ToLaunchRequest())}");
+                        continue;
+                    }
+
+                    Launch(savedApp.ToLaunchRequest(), savedApp.RuleId);
                 }
 
                 ScanMonitorRules(save: true);
@@ -1584,10 +1598,12 @@ internal static partial class Program
 
                 var request = savedApp.ToLaunchRequest();
                 process.EnableRaisingEvents = true;
+                var startedAt = TryGetProcessStartedAt(process)
+                    ?? (savedApp.StartedAt == default ? DateTimeOffset.Now : savedApp.StartedAt);
                 var app = new MonitoredApp(
                     request,
                     process,
-                    savedApp.StartedAt == default ? DateTimeOffset.Now : savedApp.StartedAt,
+                    startedAt,
                     savedApp.DesktopId,
                     savedApp.WindowBounds,
                     savedApp.RuleId);
@@ -1617,8 +1633,102 @@ internal static partial class Program
             }
         }
 
+        private static string GetSavedAppRestartKey(SavedApp savedApp)
+        {
+            return GetLaunchRequestRestartKey(savedApp.ToLaunchRequest(), savedApp.RuleId);
+        }
+
+        private static string GetLaunchRequestRestartKey(LaunchRequest request, Guid? ruleId)
+        {
+            var builder = new StringBuilder()
+                .Append(ruleId?.ToString("D") ?? string.Empty)
+                .Append('|')
+                .Append(request.Kind)
+                .Append('|')
+                .Append(NormalizeRestartKeyPart(request.Executable));
+
+            foreach (var argument in request.Arguments ?? [])
+            {
+                builder.Append('|').Append(NormalizeRestartKeyPart(argument));
+            }
+
+            return builder.ToString();
+        }
+
+        private static string NormalizeRestartKeyPart(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return string.Empty;
+            }
+
+            try
+            {
+                if (Path.IsPathFullyQualified(value))
+                {
+                    return Path.GetFullPath(value).Trim().ToLowerInvariant();
+                }
+            }
+            catch
+            {
+                // Use the trimmed value below.
+            }
+
+            return value.Trim().ToLowerInvariant();
+        }
+
+        private static DateTimeOffset? TryGetProcessStartedAt(Process process)
+        {
+            try
+            {
+                return new DateTimeOffset(process.StartTime);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static bool HasSameSavedCommandLine(Process process, SavedApp savedApp)
+        {
+            var processExecutable = TryGetProcessExecutablePath(process);
+            if (!string.IsNullOrWhiteSpace(processExecutable)
+                && !string.Equals(
+                    NormalizeRestartKeyPart(processExecutable),
+                    NormalizeRestartKeyPart(savedApp.Executable),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var commandLine = TryGetProcessCommandLine(process.Id);
+            if (string.IsNullOrWhiteSpace(commandLine))
+            {
+                return !string.IsNullOrWhiteSpace(processExecutable);
+            }
+
+            var arguments = CommandLineToArguments(commandLine);
+            if (arguments.Length == 0)
+            {
+                return false;
+            }
+
+            var processRequest = new LaunchRequest(arguments[0], arguments.Skip(1).ToArray(), null, savedApp.Kind, null);
+            return string.Equals(
+                GetLaunchRequestRestartKey(processRequest, savedApp.RuleId),
+                GetSavedAppRestartKey(savedApp),
+                StringComparison.OrdinalIgnoreCase);
+        }
+
         private static bool MatchesSavedProcess(Process process, SavedApp savedApp)
         {
+            var expectedProcessName = Path.GetFileNameWithoutExtension(savedApp.Executable);
+            if (!string.IsNullOrWhiteSpace(expectedProcessName)
+                && !string.Equals(process.ProcessName, expectedProcessName, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
             if (savedApp.StartedAt != default)
             {
                 try
@@ -1626,18 +1736,16 @@ internal static partial class Program
                     var delta = (process.StartTime.ToUniversalTime() - savedApp.StartedAt.UtcDateTime).Duration();
                     if (delta > TimeSpan.FromSeconds(2))
                     {
-                        return false;
+                        return HasSameSavedCommandLine(process, savedApp);
                     }
                 }
                 catch
                 {
-                    return false;
+                    return HasSameSavedCommandLine(process, savedApp);
                 }
             }
 
-            var expectedProcessName = Path.GetFileNameWithoutExtension(savedApp.Executable);
-            return string.IsNullOrWhiteSpace(expectedProcessName)
-                || string.Equals(process.ProcessName, expectedProcessName, StringComparison.OrdinalIgnoreCase);
+            return true;
         }
 
         private bool IsAlreadyMonitoredProcess(int processId)
@@ -1884,6 +1992,7 @@ internal static partial class Program
                         resolvedProcess.EnableRaisingEvents = true;
                         resolvedProcess.Exited += (_, _) => Post(() => RemoveExitedApp(app, resolvedProcess));
                         app.Process = resolvedProcess;
+                        app.StartedAt = TryGetProcessStartedAt(resolvedProcess) ?? app.StartedAt;
                         previousProcess.Dispose();
                     }
                     catch
@@ -2670,7 +2779,7 @@ internal static partial class Program
 
         public Process Process { get; set; } = process;
 
-        public DateTimeOffset StartedAt { get; } = startedAt;
+        public DateTimeOffset StartedAt { get; set; } = startedAt;
 
         public Guid? DesktopId { get; set; } = desktopId;
 
