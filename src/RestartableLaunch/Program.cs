@@ -1125,9 +1125,12 @@ internal static partial class Program
                     return;
                 }
 
-                foreach (var request in session.Apps)
+                foreach (var savedApp in session.Apps)
                 {
-                    Launch(request);
+                    if (!TryAdoptSavedApp(savedApp))
+                    {
+                        Launch(savedApp.ToLaunchRequest());
+                    }
                 }
             }
             catch (Exception ex)
@@ -1234,6 +1237,85 @@ internal static partial class Program
             Remove(app);
         }
 
+        private bool TryAdoptSavedApp(SavedApp savedApp)
+        {
+            if (savedApp.ProcessId <= 0)
+            {
+                return false;
+            }
+
+            try
+            {
+                var process = Process.GetProcessById(savedApp.ProcessId);
+                if (process.HasExited || !MatchesSavedProcess(process, savedApp))
+                {
+                    process.Dispose();
+                    return false;
+                }
+
+                if (apps.Any(app => !app.Process.HasExited && app.Process.Id == process.Id))
+                {
+                    process.Dispose();
+                    return true;
+                }
+
+                var request = savedApp.ToLaunchRequest();
+                process.EnableRaisingEvents = true;
+                var app = new MonitoredApp(
+                    request,
+                    process,
+                    savedApp.StartedAt == default ? DateTimeOffset.Now : savedApp.StartedAt,
+                    savedApp.DesktopId,
+                    savedApp.WindowBounds);
+
+                apps.Add(app);
+                process.Exited += (_, _) => Post(() => RemoveExitedApp(app, process));
+
+                var window = FindTopLevelWindow(process.Id);
+                if (window != IntPtr.Zero)
+                {
+                    app.WindowHandle = window;
+                    app.HasResolvedWindow = true;
+                    UpdateWindowPlacement(app, window, savedApp.DesktopId, savedApp.WindowBounds, save: false);
+                }
+                else
+                {
+                    _ = TrackWindowPlacementAsync(app, savedApp.DesktopId, savedApp.WindowBounds, GetTopLevelWindowHandles());
+                }
+
+                SaveSession();
+                mainForm.RefreshApps();
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool MatchesSavedProcess(Process process, SavedApp savedApp)
+        {
+            if (savedApp.StartedAt != default)
+            {
+                try
+                {
+                    var delta = (process.StartTime.ToUniversalTime() - savedApp.StartedAt.UtcDateTime).Duration();
+                    if (delta > TimeSpan.FromSeconds(2))
+                    {
+                        return false;
+                    }
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+
+            var expectedProcessName = Path.GetFileNameWithoutExtension(savedApp.Executable);
+            return string.IsNullOrWhiteSpace(expectedProcessName)
+                || string.Equals(process.ProcessName, expectedProcessName, StringComparison.OrdinalIgnoreCase);
+        }
+
         private void SaveSession()
         {
             if (IsExiting && !sessionEnding)
@@ -1241,7 +1323,7 @@ internal static partial class Program
                 return;
             }
 
-            var session = new SavedSession(apps.Select(static app => app.Request with { DesktopId = app.DesktopId, WindowBounds = app.WindowBounds }).ToArray());
+            var session = new SavedSession(apps.Select(static app => SavedApp.FromMonitoredApp(app)).ToArray());
             File.WriteAllText(SessionPath, JsonSerializer.Serialize(session, JsonOptions));
             SaveActiveState();
         }
@@ -1795,7 +1877,34 @@ internal static partial class Program
 
     private sealed record LaunchRequest(string Executable, string[] Arguments, Guid? DesktopId, LaunchKind Kind, WindowBounds? WindowBounds);
 
-    private sealed record SavedSession(LaunchRequest[] Apps);
+    private sealed record SavedSession(SavedApp[] Apps);
+
+    private sealed record SavedApp(
+        int ProcessId,
+        DateTimeOffset StartedAt,
+        string Executable,
+        string[] Arguments,
+        Guid? DesktopId,
+        LaunchKind Kind,
+        WindowBounds? WindowBounds)
+    {
+        public static SavedApp FromMonitoredApp(MonitoredApp app)
+        {
+            return new SavedApp(
+                app.Process.Id,
+                app.StartedAt,
+                app.Request.Executable,
+                app.Request.Arguments,
+                app.DesktopId,
+                app.Request.Kind,
+                app.WindowBounds);
+        }
+
+        public LaunchRequest ToLaunchRequest()
+        {
+            return new LaunchRequest(Executable, Arguments ?? [], DesktopId, Kind, WindowBounds);
+        }
+    }
 
     private sealed record ActiveState(ActiveAppState[] Apps);
 
