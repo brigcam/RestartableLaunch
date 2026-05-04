@@ -9,6 +9,7 @@
     <AssemblyName>RestartableLaunch</AssemblyName>
     <RootNamespace>RestartableLaunch</RootNamespace>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <ApplicationIcon>assets\RestartableLaunch.ico</ApplicationIcon>
   </PropertyGroup>
 
 </Project>

@@ -19,6 +19,7 @@ internal static partial class Program
 
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private static readonly JsonSerializerOptions PipeJsonOptions = new();
+    private static readonly Icon AppIcon = LoadAppIcon();
 
     [STAThread]
     private static int Main(string[] args)
@@ -214,6 +215,26 @@ internal static partial class Program
         {
             ShowWindow(consoleWindow, SwHide);
         }
+    }
+
+    private static Icon LoadAppIcon()
+    {
+        var path = Environment.ProcessPath ?? Application.ExecutablePath;
+        if (!string.IsNullOrWhiteSpace(path))
+        {
+            var icon = Icon.ExtractAssociatedIcon(path);
+            if (icon is not null)
+            {
+                return icon;
+            }
+        }
+
+        return SystemIcons.Application;
+    }
+
+    private static Icon CloneAppIcon()
+    {
+        return (Icon)AppIcon.Clone();
     }
 
     private static async Task<IntPtr> WaitForMainWindowAsync(Process process, CancellationToken cancellationToken)
@@ -446,7 +467,7 @@ internal static partial class Program
 
             notifyIcon = new NotifyIcon
             {
-                Icon = SystemIcons.Application,
+                Icon = CloneAppIcon(),
                 Text = "RestartableLaunch",
                 Visible = true,
                 ContextMenuStrip = new ContextMenuStrip(),
@@ -636,6 +657,7 @@ internal static partial class Program
         {
             this.context = context;
             Text = "RestartableLaunch";
+            Icon = CloneAppIcon();
             Width = 900;
             Height = 420;
             StartPosition = FormStartPosition.CenterScreen;
