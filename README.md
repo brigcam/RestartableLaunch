@@ -32,11 +32,13 @@ RestartableLaunch.exe --run "C:\Path\App.exe" [arguments...]
 Run the executable without arguments, or use `--gui`, to open or reopen the tray
 manager window.
 
-Use `--list` or `-l` to print the monitored applications to the console:
+Console output lives in the companion CLI executable:
 
 ```powershell
-RestartableLaunch.exe --list
+RestartableLaunchCLI.exe list
 ```
+
+The GUI executable does not print to a console.
 
 The GUI window lists the currently monitored applications and their command
 lines. It also includes checkboxes to start RestartableLaunch at user logon and

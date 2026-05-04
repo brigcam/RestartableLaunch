@@ -28,12 +28,6 @@ internal static partial class Program
         ApplicationConfiguration.Initialize();
 
         var command = AppCommand.Parse(args);
-        if (command.Mode == CommandMode.List)
-        {
-            Console.WriteLine(ReadActiveStateList());
-            return 0;
-        }
-
         using var mutex = new Mutex(false, MutexName, out var isFirstInstance);
 
         if (!isFirstInstance)
@@ -1339,11 +1333,6 @@ internal static partial class Program
             if (Is(args[0], "--restore"))
             {
                 return new AppCommand(null, true, CommandMode.Launch);
-            }
-
-            if (Is(args[0], "--list") || Is(args[0], "-l"))
-            {
-                return new AppCommand(null, false, CommandMode.List);
             }
 
             if (Is(args[0], "--gui"))
