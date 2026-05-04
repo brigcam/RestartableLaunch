@@ -16,6 +16,7 @@ internal static partial class Program
     private const int SwHide = 0;
     private const int WindowWaitTimeoutMilliseconds = 30000;
     private const int WindowWaitPollMilliseconds = 250;
+    private const string StartupRunName = "RestartableLaunch";
 
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private static readonly JsonSerializerOptions PipeJsonOptions = new();
@@ -44,7 +45,6 @@ internal static partial class Program
         HideConsoleWindow();
 
         var context = new ManagerContext();
-        RegisterApplicationRestart("--restore", RestartNoCrash | RestartNoHang);
         _ = StartPipeServer(context);
 
         if (command.Restore)
@@ -56,13 +56,12 @@ internal static partial class Program
             context.Launch(command.Launch);
         }
 
-        if (command.Mode == CommandMode.ShowGui || command.Launch is null)
+        if (command.Mode == CommandMode.ShowGui || (!command.Restore && command.Launch is null))
         {
             context.ShowMainWindow();
         }
 
         Application.Run(context);
-        UnregisterApplicationRestart();
         return 0;
     }
 
@@ -350,6 +349,34 @@ internal static partial class Program
         private static string GetCommandValue()
         {
             return $"{QuoteArgument(Application.ExecutablePath)} \"%1\"";
+        }
+    }
+
+    private static class LoginStartup
+    {
+        private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+
+        public static bool IsRegistered()
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(RunKeyPath);
+            return string.Equals(key?.GetValue(StartupRunName) as string, GetCommandValue(), StringComparison.OrdinalIgnoreCase);
+        }
+
+        public static void Register()
+        {
+            using var key = Registry.CurrentUser.CreateSubKey(RunKeyPath);
+            key.SetValue(StartupRunName, GetCommandValue(), RegistryValueKind.String);
+        }
+
+        public static void Unregister()
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(RunKeyPath, writable: true);
+            key?.DeleteValue(StartupRunName, throwOnMissingValue: false);
+        }
+
+        private static string GetCommandValue()
+        {
+            return $"{QuoteArgument(Application.ExecutablePath)} --restore";
         }
     }
 
@@ -742,7 +769,9 @@ internal static partial class Program
     {
         private readonly ManagerContext context;
         private readonly ListView listView = new();
+        private readonly CheckBox startupCheckBox = new();
         private readonly CheckBox explorerMenuCheckBox = new();
+        private bool updatingStartupCheckBox;
         private bool updatingExplorerMenuCheckBox;
 
         public MainForm(ManagerContext context)
@@ -757,12 +786,19 @@ internal static partial class Program
             var topPanel = new Panel
             {
                 Dock = DockStyle.Top,
-                Height = 42,
+                Height = 66,
                 Padding = new Padding(12, 10, 12, 6),
             };
 
+            startupCheckBox.AutoSize = true;
+            startupCheckBox.Text = "Start at user logon and restore monitored apps";
+            startupCheckBox.Location = new Point(0, 0);
+            startupCheckBox.CheckedChanged += (_, _) => ToggleStartup();
+            topPanel.Controls.Add(startupCheckBox);
+
             explorerMenuCheckBox.AutoSize = true;
             explorerMenuCheckBox.Text = "RestartableLaunch in Explorer context menu";
+            explorerMenuCheckBox.Location = new Point(0, 26);
             explorerMenuCheckBox.CheckedChanged += (_, _) => ToggleExplorerContextMenu();
             topPanel.Controls.Add(explorerMenuCheckBox);
 
@@ -783,6 +819,7 @@ internal static partial class Program
                 Hide();
             };
 
+            RefreshStartupState();
             RefreshExplorerContextMenuState();
         }
 
@@ -813,6 +850,47 @@ internal static partial class Program
             finally
             {
                 updatingExplorerMenuCheckBox = false;
+            }
+        }
+
+        private void RefreshStartupState()
+        {
+            updatingStartupCheckBox = true;
+            try
+            {
+                startupCheckBox.Checked = LoginStartup.IsRegistered();
+            }
+            finally
+            {
+                updatingStartupCheckBox = false;
+            }
+        }
+
+        private void ToggleStartup()
+        {
+            if (updatingStartupCheckBox)
+            {
+                return;
+            }
+
+            try
+            {
+                if (startupCheckBox.Checked)
+                {
+                    LoginStartup.Register();
+                }
+                else
+                {
+                    LoginStartup.Unregister();
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox(IntPtr.Zero, ex.Message, "RestartableLaunch", 0x10);
+            }
+            finally
+            {
+                RefreshStartupState();
             }
         }
 

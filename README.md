@@ -1,10 +1,10 @@
 # RestartableLaunch
 
-RestartableLaunch is a tiny Windows tray manager that makes other programs
-eligible for Windows app restart. It starts target processes, stays alive in the
-tray while they are running, and registers itself with `RegisterApplicationRestart`.
+RestartableLaunch is a tiny Windows tray manager that restores selected programs
+at user logon. It starts target processes, stays alive in the tray while they are
+running, and saves enough session state to relaunch them later.
 
-This is useful for applications that do not register themselves as restartable.
+This is useful for applications that do not restore themselves after sign-in.
 
 ## Usage
 
@@ -38,9 +38,10 @@ Use `--list` or `-l` to print the monitored applications to the console:
 RestartableLaunch.exe --list
 ```
 
-The GUI window also lists the currently monitored applications and their command
-lines. It also includes a checkbox to register or unregister RestartableLaunch
-in Explorer's context menu for the current user.
+The GUI window lists the currently monitored applications and their command
+lines. It also includes checkboxes to start RestartableLaunch at user logon and
+to register or unregister RestartableLaunch in Explorer's context menu for the
+current user.
 
 ## Explorer context menu
 
@@ -64,6 +65,7 @@ launches normally.
 ## Notes
 
 - The tray manager must remain running for Windows to restart it.
+- To restore apps after logon, enable the startup checkbox in the GUI.
 - If a wrapped application is closed manually, it is removed from the monitored list.
 - Unsaved application state is still the responsibility of the wrapped app.
 - Virtual desktop placement is best effort because Windows may reject desktop
