@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Win32;
@@ -248,45 +249,146 @@ internal static partial class Program
 
     private static Icon TryGetProcessIcon(Process process)
     {
-        try
+        var processName = TryGetProcessName(process);
+        var fileName = TryGetProcessExecutablePath(process);
+        if (TryExtractAndCacheIcon(fileName, processName, out var icon)
+            || TryLoadCachedIcon("path", fileName, out icon)
+            || TryLoadCachedIcon("process", processName, out icon))
         {
-            var fileName = process.MainModule?.FileName;
-            if (!string.IsNullOrWhiteSpace(fileName))
-            {
-                var icon = Icon.ExtractAssociatedIcon(fileName);
-                if (icon is not null)
-                {
-                    return icon;
-                }
-            }
-        }
-        catch
-        {
-            // Fall back below.
+            return icon;
         }
 
         return CloneAppIcon();
     }
 
-    private static Icon TryGetFileIcon(string fileName)
+    private static Icon TryGetRuleIcon(ProcessMonitorRule rule)
     {
+        if (TryExtractAndCacheIcon(rule.ExecutablePath, rule.ProcessName, out var icon)
+            || TryLoadCachedIcon("path", rule.ExecutablePath, out icon)
+            || TryLoadCachedIcon("process", rule.ProcessName, out icon))
+        {
+            return icon;
+        }
+
+        return CloneAppIcon();
+    }
+
+    private static bool TryExtractAndCacheIcon(string fileName, string processName, out Icon icon)
+    {
+        icon = null!;
         try
         {
             if (!string.IsNullOrWhiteSpace(fileName) && File.Exists(fileName))
             {
-                var icon = Icon.ExtractAssociatedIcon(fileName);
-                if (icon is not null)
+                var extracted = Icon.ExtractAssociatedIcon(fileName);
+                if (extracted is not null)
                 {
-                    return icon;
+                    SaveIconToCache("path", fileName, extracted);
+                    SaveIconToCache("process", processName, extracted);
+                    icon = extracted;
+                    return true;
                 }
             }
         }
         catch
         {
-            // Fall back below.
+            // Fall back to the persistent cache.
         }
 
-        return CloneAppIcon();
+        return false;
+    }
+
+    private static bool TryLoadCachedIcon(string kind, string value, out Icon icon)
+    {
+        icon = null!;
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        var path = GetIconCachePath(kind, value);
+        if (!File.Exists(path))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var cached = new Icon(path);
+            icon = (Icon)cached.Clone();
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void SaveIconToCache(string kind, string value, Icon icon)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return;
+        }
+
+        try
+        {
+            Directory.CreateDirectory(IconCacheDirectory);
+            using var stream = File.Create(GetIconCachePath(kind, value));
+            icon.Save(stream);
+        }
+        catch
+        {
+            // Icon cache is opportunistic; UI can always fall back to the app icon.
+        }
+    }
+
+    private static string GetIconCachePath(string kind, string value)
+    {
+        var normalized = $"{kind}:{NormalizeIconCacheValue(kind, value)}";
+        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalized))).ToLowerInvariant();
+        return Path.Combine(IconCacheDirectory, $"{kind}-{hash}.ico");
+    }
+
+    private static string NormalizeIconCacheValue(string kind, string value)
+    {
+        if (kind == "path")
+        {
+            try
+            {
+                value = Path.GetFullPath(value);
+            }
+            catch
+            {
+                // Use the original value below.
+            }
+        }
+
+        return value.Trim().ToLowerInvariant();
+    }
+
+    private static string TryGetProcessName(Process process)
+    {
+        try
+        {
+            return process.ProcessName;
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private static string TryGetProcessExecutablePath(Process process)
+    {
+        try
+        {
+            return process.MainModule?.FileName ?? string.Empty;
+        }
+        catch
+        {
+            return string.Empty;
+        }
     }
 
     private static async Task<IntPtr> WaitForMainWindowAsync(Process process, CancellationToken cancellationToken)
@@ -680,6 +782,8 @@ internal static partial class Program
     private static string SessionPath => Path.Combine(AppDataDirectory, "session.json");
 
     private static string ActiveStatePath => Path.Combine(AppDataDirectory, "active.json");
+
+    private static string IconCacheDirectory => Path.Combine(AppDataDirectory, "icons");
 
     private static class ExplorerContextMenu
     {
@@ -1455,7 +1559,41 @@ internal static partial class Program
             while (!IsExiting)
             {
                 await Task.Delay(2000);
-                Post(() => ScanMonitorRules(save: true));
+                Post(() =>
+                {
+                    RefreshIconCache();
+                    ScanMonitorRules(save: true);
+                });
+            }
+        }
+
+        private void RefreshIconCache()
+        {
+            foreach (var app in apps.ToArray())
+            {
+                try
+                {
+                    if (!app.Process.HasExited)
+                    {
+                        using var _ = TryGetProcessIcon(app.Process);
+                    }
+                }
+                catch
+                {
+                    // Cache refresh must never disturb monitoring.
+                }
+            }
+
+            foreach (var rule in monitorRules.ToArray())
+            {
+                try
+                {
+                    using var _ = TryGetRuleIcon(rule);
+                }
+                catch
+                {
+                    // Cache refresh must never disturb monitoring.
+                }
             }
         }
 
@@ -1557,18 +1695,6 @@ internal static partial class Program
             return string.IsNullOrWhiteSpace(rule.ExecutablePath)
                 || string.IsNullOrWhiteSpace(executablePath)
                 || string.Equals(rule.ExecutablePath, executablePath, StringComparison.OrdinalIgnoreCase);
-        }
-
-        private static string TryGetProcessExecutablePath(Process process)
-        {
-            try
-            {
-                return process.MainModule?.FileName ?? string.Empty;
-            }
-            catch
-            {
-                return string.Empty;
-            }
         }
 
         private void SaveSession()
@@ -1898,7 +2024,7 @@ internal static partial class Program
             foreach (var rule in context.MonitorRules)
             {
                 var imageKey = $"rule-{rule.Id}";
-                using (var icon = TryGetFileIcon(rule.ExecutablePath))
+                using (var icon = TryGetRuleIcon(rule))
                 using (var bitmap = icon.ToBitmap())
                 {
                     ruleIcons.Images.Add(imageKey, bitmap);
