@@ -2091,28 +2091,37 @@ internal static partial class Program
                 listView.Items.Add(item);
             }
 
-            var buttonPanel = new FlowLayoutPanel
+            var buttonPanel = new TableLayoutPanel
             {
                 Dock = DockStyle.Bottom,
-                Height = 44,
-                FlowDirection = FlowDirection.RightToLeft,
-                Padding = new Padding(8),
+                Height = 48,
+                ColumnCount = 4,
+                RowCount = 1,
+                Padding = new Padding(12, 8, 12, 8),
             };
+            buttonPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            buttonPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 96));
+            buttonPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 8));
+            buttonPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 96));
+            buttonPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
             monitorAllInstancesCheckBox.Text = "Monitor all instances of this app";
             monitorAllInstancesCheckBox.AutoSize = true;
-            monitorAllInstancesCheckBox.Margin = new Padding(8, 10, 24, 8);
+            monitorAllInstancesCheckBox.Anchor = AnchorStyles.Left;
+            monitorAllInstancesCheckBox.Margin = new Padding(0);
 
             okButton.Text = "Add";
-            okButton.Width = 90;
+            okButton.Dock = DockStyle.Fill;
+            okButton.Margin = new Padding(0);
             okButton.Click += (_, _) => AcceptSelection();
             cancelButton.Text = "Cancel";
-            cancelButton.Width = 90;
+            cancelButton.Dock = DockStyle.Fill;
+            cancelButton.Margin = new Padding(0);
             cancelButton.Click += (_, _) => DialogResult = DialogResult.Cancel;
 
-            buttonPanel.Controls.Add(okButton);
-            buttonPanel.Controls.Add(cancelButton);
-            buttonPanel.Controls.Add(monitorAllInstancesCheckBox);
+            buttonPanel.Controls.Add(monitorAllInstancesCheckBox, 0, 0);
+            buttonPanel.Controls.Add(cancelButton, 1, 0);
+            buttonPanel.Controls.Add(okButton, 3, 0);
 
             Controls.Add(listView);
             Controls.Add(buttonPanel);
