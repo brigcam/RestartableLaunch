@@ -1704,7 +1704,7 @@ internal static partial class Program
             listView.BorderStyle = BorderStyle.None;
             listView.View = View.Details;
             listView.FullRowSelect = true;
-            listView.GridLines = true;
+            listView.GridLines = false;
             listView.HideSelection = false;
             listView.MultiSelect = true;
             listView.Columns.Add("Process", 150);
@@ -2005,7 +2005,7 @@ internal static partial class Program
             listView.Dock = DockStyle.Fill;
             listView.View = View.Details;
             listView.FullRowSelect = true;
-            listView.GridLines = true;
+            listView.GridLines = false;
             listView.SmallImageList = windowIcons;
             listView.Columns.Add(string.Empty, 34);
             listView.Columns.Add("Process", 160);
