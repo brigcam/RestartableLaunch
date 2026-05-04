@@ -5,11 +5,10 @@
       <stop offset="1" stop-color="#08A07A"/>
     </linearGradient>
   </defs>
-  <rect x="18" y="18" width="220" height="220" rx="52" fill="url(#bg)"/>
-  <rect x="48" y="62" width="160" height="132" rx="22" fill="#F8FCFF"/>
-  <path d="M70 62h116a22 22 0 0 1 22 22v28H48V84a22 22 0 0 1 22-22z" fill="#11324A"/>
-  <circle cx="74" cy="88" r="7" fill="#6EE7B7"/>
-  <circle cx="98" cy="88" r="7" fill="#FDE68A"/>
-  <circle cx="122" cy="88" r="7" fill="#FDA4AF"/>
-  <path d="M82 143h56v-19l38 30-38 30v-19H82z" fill="#11324A"/>
+  <rect x="36" y="48" width="184" height="160" rx="28" fill="#F8FCFF" stroke="url(#bg)" stroke-width="18"/>
+  <path d="M64 48h128a28 28 0 0 1 28 28v40H36V76a28 28 0 0 1 28-28z" fill="#11324A"/>
+  <circle cx="70" cy="82" r="8" fill="#6EE7B7"/>
+  <circle cx="98" cy="82" r="8" fill="#FDE68A"/>
+  <circle cx="126" cy="82" r="8" fill="#FDA4AF"/>
+  <path d="M73 147h66v-22l46 36-46 36v-22H73z" fill="#11324A"/>
 </svg>
