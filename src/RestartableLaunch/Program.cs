@@ -246,6 +246,49 @@ internal static partial class Program
         return (Icon)AppIcon.Clone();
     }
 
+    private static Icon TryGetProcessIcon(Process process)
+    {
+        try
+        {
+            var fileName = process.MainModule?.FileName;
+            if (!string.IsNullOrWhiteSpace(fileName))
+            {
+                var icon = Icon.ExtractAssociatedIcon(fileName);
+                if (icon is not null)
+                {
+                    return icon;
+                }
+            }
+        }
+        catch
+        {
+            // Fall back below.
+        }
+
+        return CloneAppIcon();
+    }
+
+    private static Icon TryGetFileIcon(string fileName)
+    {
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(fileName) && File.Exists(fileName))
+            {
+                var icon = Icon.ExtractAssociatedIcon(fileName);
+                if (icon is not null)
+                {
+                    return icon;
+                }
+            }
+        }
+        catch
+        {
+            // Fall back below.
+        }
+
+        return CloneAppIcon();
+    }
+
     private static async Task<IntPtr> WaitForMainWindowAsync(Process process, CancellationToken cancellationToken)
     {
         var deadline = DateTimeOffset.UtcNow.AddMilliseconds(WindowWaitTimeoutMilliseconds);
@@ -1666,6 +1709,8 @@ internal static partial class Program
         private readonly ManagerContext context;
         private readonly ListView listView = new();
         private readonly ListView rulesView = new();
+        private readonly ImageList appIcons = new();
+        private readonly ImageList ruleIcons = new();
         private readonly Button addWindowButton = new();
         private readonly Button removeButton = new();
         private readonly CheckBox startupCheckBox = new();
@@ -1728,6 +1773,11 @@ internal static partial class Program
             };
             removeButton.Location = new Point(addWindowButton.Left - removeButton.Width - 10, 26);
 
+            appIcons.ColorDepth = ColorDepth.Depth32Bit;
+            appIcons.ImageSize = new Size(16, 16);
+            ruleIcons.ColorDepth = ColorDepth.Depth32Bit;
+            ruleIcons.ImageSize = new Size(16, 16);
+
             listView.Dock = DockStyle.Fill;
             listView.BorderStyle = BorderStyle.None;
             listView.View = View.Details;
@@ -1735,11 +1785,13 @@ internal static partial class Program
             listView.GridLines = false;
             listView.HideSelection = false;
             listView.MultiSelect = true;
+            listView.SmallImageList = appIcons;
+            listView.Columns.Add(string.Empty, 34);
             listView.Columns.Add("Process", 150);
             listView.Columns.Add("PID", 80);
             listView.Columns.Add("Mode", 110);
             listView.Columns.Add("Started", 150);
-            listView.Columns.Add("Command", 520);
+            listView.Columns.Add("Command", 486);
             listView.Columns.Add("Desktop", 240);
             listView.ColumnClick += (_, e) => SortListByColumn(e.Column);
             listView.SelectedIndexChanged += (_, _) => UpdateRemoveButtonState();
@@ -1774,8 +1826,10 @@ internal static partial class Program
             rulesView.View = View.Details;
             rulesView.FullRowSelect = true;
             rulesView.HideSelection = false;
+            rulesView.SmallImageList = ruleIcons;
+            rulesView.Columns.Add(string.Empty, 34);
             rulesView.Columns.Add("Process", 180);
-            rulesView.Columns.Add("Executable", 760);
+            rulesView.Columns.Add("Executable", 726);
             rulesView.SelectedIndexChanged += (_, _) => UpdateRemoveButtonState();
             rulesView.ColumnClick += (_, e) => SortListByColumn(rulesView, e.Column);
             rulesView.KeyDown += (_, e) =>
@@ -1813,12 +1867,25 @@ internal static partial class Program
         {
             listView.BeginUpdate();
             listView.Items.Clear();
+            appIcons.Images.Clear();
             rulesView.BeginUpdate();
             rulesView.Items.Clear();
+            ruleIcons.Images.Clear();
 
             foreach (var app in context.Apps)
             {
-                var item = new ListViewItem(app.Process.ProcessName);
+                var imageKey = $"app-{app.Process.Id}";
+                using (var icon = TryGetProcessIcon(app.Process))
+                using (var bitmap = icon.ToBitmap())
+                {
+                    appIcons.Images.Add(imageKey, bitmap);
+                }
+
+                var item = new ListViewItem(string.Empty)
+                {
+                    ImageKey = imageKey,
+                };
+                item.SubItems.Add(app.Process.ProcessName);
                 item.SubItems.Add(app.Process.Id.ToString());
                 item.SubItems.Add(app.RuleId is null ? "Single" : "All instances");
                 item.SubItems.Add(app.StartedAt.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss"));
@@ -1830,7 +1897,18 @@ internal static partial class Program
 
             foreach (var rule in context.MonitorRules)
             {
-                var item = new ListViewItem(rule.ProcessName);
+                var imageKey = $"rule-{rule.Id}";
+                using (var icon = TryGetFileIcon(rule.ExecutablePath))
+                using (var bitmap = icon.ToBitmap())
+                {
+                    ruleIcons.Images.Add(imageKey, bitmap);
+                }
+
+                var item = new ListViewItem(string.Empty)
+                {
+                    ImageKey = imageKey,
+                };
+                item.SubItems.Add(rule.ProcessName);
                 item.SubItems.Add(string.IsNullOrWhiteSpace(rule.ExecutablePath) ? "(process name only)" : rule.ExecutablePath);
                 item.Tag = rule;
                 rulesView.Items.Add(item);
