@@ -762,7 +762,7 @@ internal static partial class Program
 
                 var app = new MonitoredApp(request, process, DateTimeOffset.Now, null, null);
                 apps.Add(app);
-                process.Exited += (_, _) => Post(() => Remove(app));
+                process.Exited += (_, _) => Post(() => RemoveExitedApp(app));
 
                 SaveSession();
                 mainForm.RefreshApps();
@@ -800,7 +800,7 @@ internal static partial class Program
                 process.EnableRaisingEvents = true;
                 var app = new MonitoredApp(request, process, DateTimeOffset.Now, desktopId, bounds);
                 apps.Add(app);
-                process.Exited += (_, _) => Post(() => Remove(app));
+                process.Exited += (_, _) => Post(() => RemoveExitedApp(app));
 
                 SaveSession();
                 mainForm.RefreshApps();
@@ -939,8 +939,23 @@ internal static partial class Program
             mainForm.RefreshApps();
         }
 
+        private void RemoveExitedApp(MonitoredApp app)
+        {
+            if (sessionEnding)
+            {
+                return;
+            }
+
+            Remove(app);
+        }
+
         private void SaveSession()
         {
+            if (IsExiting && !sessionEnding)
+            {
+                return;
+            }
+
             var session = new SavedSession(apps.Select(static app => app.Request with { DesktopId = app.DesktopId, WindowBounds = app.WindowBounds }).ToArray());
             File.WriteAllText(SessionPath, JsonSerializer.Serialize(session, JsonOptions));
             SaveActiveState();
@@ -1001,6 +1016,7 @@ internal static partial class Program
         {
             sessionEnding = true;
             SaveSession();
+            ExitThread();
         }
     }
 
@@ -1012,6 +1028,8 @@ internal static partial class Program
         private readonly Button removeButton = new();
         private readonly CheckBox startupCheckBox = new();
         private readonly CheckBox explorerMenuCheckBox = new();
+        private readonly StatusStrip statusStrip = new();
+        private readonly ToolStripStatusLabel statusLabel = new();
         private bool updatingStartupCheckBox;
         private bool updatingExplorerMenuCheckBox;
 
@@ -1020,57 +1038,64 @@ internal static partial class Program
             this.context = context;
             Text = "RestartableLaunch";
             Icon = CloneAppIcon();
-            Width = 900;
-            Height = 420;
+            Width = 1040;
+            Height = 560;
             StartPosition = FormStartPosition.CenterScreen;
+            MinimumSize = new Size(760, 420);
+            BackColor = Color.FromArgb(248, 250, 252);
 
             var topPanel = new Panel
             {
                 Dock = DockStyle.Top,
-                Height = 66,
-                Padding = new Padding(12, 10, 12, 6),
+                Height = 88,
+                Padding = new Padding(16, 12, 16, 10),
+                BackColor = Color.White,
             };
 
             startupCheckBox.AutoSize = true;
             startupCheckBox.Text = "Start at user logon and restore monitored apps";
-            startupCheckBox.Location = new Point(0, 0);
+            startupCheckBox.Location = new Point(16, 12);
             startupCheckBox.CheckedChanged += (_, _) => ToggleStartup();
             topPanel.Controls.Add(startupCheckBox);
 
             explorerMenuCheckBox.AutoSize = true;
             explorerMenuCheckBox.Text = "RestartableLaunch in Explorer context menu";
-            explorerMenuCheckBox.Location = new Point(0, 26);
+            explorerMenuCheckBox.Location = new Point(16, 40);
             explorerMenuCheckBox.CheckedChanged += (_, _) => ToggleExplorerContextMenu();
             topPanel.Controls.Add(explorerMenuCheckBox);
 
-            addWindowButton.Text = "Add open window...";
+            addWindowButton.Text = "+ Add Window";
             addWindowButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-            addWindowButton.Size = new Size(140, 28);
-            addWindowButton.Location = new Point(topPanel.Width - addWindowButton.Width - 12, 17);
+            addWindowButton.Size = new Size(124, 34);
+            addWindowButton.FlatStyle = FlatStyle.System;
+            addWindowButton.Location = new Point(topPanel.Width - addWindowButton.Width - 16, 26);
             addWindowButton.Click += (_, _) => AddOpenWindow();
             topPanel.Controls.Add(addWindowButton);
 
             removeButton.Text = "Remove";
             removeButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-            removeButton.Size = new Size(90, 28);
+            removeButton.Size = new Size(96, 34);
+            removeButton.FlatStyle = FlatStyle.System;
             removeButton.Enabled = false;
             removeButton.Click += (_, _) => RemoveSelectedApps();
             topPanel.Controls.Add(removeButton);
             topPanel.Resize += (_, _) =>
             {
-                addWindowButton.Location = new Point(topPanel.ClientSize.Width - addWindowButton.Width - 12, 17);
-                removeButton.Location = new Point(addWindowButton.Left - removeButton.Width - 8, 17);
+                addWindowButton.Location = new Point(topPanel.ClientSize.Width - addWindowButton.Width - 16, 26);
+                removeButton.Location = new Point(addWindowButton.Left - removeButton.Width - 10, 26);
             };
-            removeButton.Location = new Point(addWindowButton.Left - removeButton.Width - 8, 17);
+            removeButton.Location = new Point(addWindowButton.Left - removeButton.Width - 10, 26);
 
             listView.Dock = DockStyle.Fill;
+            listView.BorderStyle = BorderStyle.None;
             listView.View = View.Details;
             listView.FullRowSelect = true;
             listView.GridLines = true;
+            listView.HideSelection = false;
             listView.MultiSelect = true;
             listView.Columns.Add("PID", 80);
             listView.Columns.Add("Started", 150);
-            listView.Columns.Add("Command line", 520);
+            listView.Columns.Add("Command", 620);
             listView.Columns.Add("Desktop", 240);
             listView.SelectedIndexChanged += (_, _) => UpdateRemoveButtonState();
             listView.KeyDown += (_, e) =>
@@ -1082,7 +1107,13 @@ internal static partial class Program
                 }
             };
             listView.ContextMenuStrip = BuildListContextMenu();
+
+            statusStrip.SizingGrip = false;
+            statusStrip.BackColor = Color.White;
+            statusStrip.Items.Add(statusLabel);
+
             Controls.Add(listView);
+            Controls.Add(statusStrip);
             Controls.Add(topPanel);
 
             FormClosing += (_, e) =>
@@ -1112,6 +1143,9 @@ internal static partial class Program
 
             listView.EndUpdate();
             UpdateRemoveButtonState();
+            statusLabel.Text = context.Apps.Count == 1
+                ? "1 monitored app"
+                : $"{context.Apps.Count} monitored apps";
         }
 
         private ContextMenuStrip BuildListContextMenu()

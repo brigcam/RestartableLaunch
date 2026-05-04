@@ -74,6 +74,9 @@ launches normally.
 
 - The tray manager must remain running for Windows to restart it.
 - To restore apps after logon, enable the startup checkbox in the GUI.
+- During shutdown or logoff, RestartableLaunch freezes the monitored list,
+  saves it immediately, and ignores process-exit events so Windows closing apps
+  cannot accidentally remove them from the next restore.
 - If a wrapped application is closed manually, it is removed from the monitored list.
 - Unsaved application state is still the responsibility of the wrapped app.
 - Virtual desktop placement is best effort because Windows may reject desktop
