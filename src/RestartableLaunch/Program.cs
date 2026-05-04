@@ -247,6 +247,15 @@ internal static partial class Program
         return (Icon)AppIcon.Clone();
     }
 
+    private static void AddIconImage(ImageList imageList, string key, Icon icon)
+    {
+        var bitmap = new Bitmap(imageList.ImageSize.Width, imageList.ImageSize.Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        using var graphics = Graphics.FromImage(bitmap);
+        graphics.Clear(Color.Transparent);
+        graphics.DrawIcon(icon, new Rectangle(Point.Empty, imageList.ImageSize));
+        imageList.Images.Add(key, bitmap);
+    }
+
     private static Icon TryGetProcessIcon(Process process)
     {
         var processName = TryGetProcessName(process);
@@ -2002,9 +2011,8 @@ internal static partial class Program
             {
                 var imageKey = $"app-{app.Process.Id}";
                 using (var icon = TryGetProcessIcon(app.Process))
-                using (var bitmap = icon.ToBitmap())
                 {
-                    appIcons.Images.Add(imageKey, bitmap);
+                    AddIconImage(appIcons, imageKey, icon);
                 }
 
                 var item = new ListViewItem(string.Empty)
@@ -2025,9 +2033,8 @@ internal static partial class Program
             {
                 var imageKey = $"rule-{rule.Id}";
                 using (var icon = TryGetRuleIcon(rule))
-                using (var bitmap = icon.ToBitmap())
                 {
-                    ruleIcons.Images.Add(imageKey, bitmap);
+                    AddIconImage(ruleIcons, imageKey, icon);
                 }
 
                 var item = new ListViewItem(string.Empty)
@@ -2280,7 +2287,7 @@ internal static partial class Program
                 var imageKey = $"window-{candidate.Handle.ToInt64()}";
                 using (var icon = TryGetWindowIcon(candidate.Handle, candidate.ProcessId))
                 {
-                    windowIcons.Images.Add(imageKey, icon.ToBitmap());
+                    AddIconImage(windowIcons, imageKey, icon);
                 }
 
                 var item = new ListViewItem(string.Empty)
