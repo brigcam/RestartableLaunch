@@ -21,10 +21,10 @@ RestartableLaunch.exe "C:\Subtitles\episode.ass"
 RestartableLaunch opens the object with its default Explorer action and monitors
 the launched process when Windows returns one.
 
-To launch a specific executable with arguments instead, use `--exec`:
+To launch a specific executable with arguments instead, use `--run` or `-r`:
 
 ```powershell
-RestartableLaunch.exe --exec "C:\Path\App.exe" [arguments...]
+RestartableLaunch.exe --run "C:\Path\App.exe" [arguments...]
 ```
 
 ## Tray UI

@@ -771,7 +771,7 @@ internal static partial class Program
                     break;
                 }
 
-                if (Is(args[executableIndex], "--exec"))
+                if (Is(args[executableIndex], "--run") || Is(args[executableIndex], "-r"))
                 {
                     launchKind = LaunchKind.Executable;
                     executableIndex++;
