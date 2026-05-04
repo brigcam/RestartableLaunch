@@ -1032,6 +1032,11 @@ internal static partial class Program
 
         public void Launch(LaunchRequest request)
         {
+            Launch(request, ruleId: null);
+        }
+
+        private void Launch(LaunchRequest request, Guid? ruleId)
+        {
             try
             {
                 var existingWindows = GetTopLevelWindowHandles();
@@ -1041,7 +1046,7 @@ internal static partial class Program
                     : StartExecutable(request);
                 process.EnableRaisingEvents = true;
 
-                var app = new MonitoredApp(request, process, startedAt, null, null, null);
+                var app = new MonitoredApp(request, process, startedAt, null, null, ruleId);
                 apps.Add(app);
                 process.Exited += (_, _) => Post(() => RemoveExitedApp(app, process));
 
@@ -1164,7 +1169,7 @@ internal static partial class Program
                 {
                     if (!TryAdoptSavedApp(savedApp))
                     {
-                        Launch(savedApp.ToLaunchRequest());
+                        Launch(savedApp.ToLaunchRequest(), savedApp.RuleId);
                     }
                 }
 
