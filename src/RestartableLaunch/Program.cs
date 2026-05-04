@@ -31,11 +31,14 @@ internal static partial class Program
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private static readonly JsonSerializerOptions PipeJsonOptions = new();
     private static readonly Icon AppIcon = LoadAppIcon();
+    private static readonly object LogLock = new();
 
     [STAThread]
     private static int Main(string[] args)
     {
+        InstallExceptionLogging();
         ApplicationConfiguration.Initialize();
+        LogMessage("startup", $"RestartableLaunch starting. Args: {string.Join(" ", args)}");
 
         var command = AppCommand.Parse(args);
         using var mutex = new Mutex(false, MutexName, out var isFirstInstance);
@@ -65,8 +68,91 @@ internal static partial class Program
             context.ShowMainWindow();
         }
 
-        Application.Run(context);
-        return 0;
+        try
+        {
+            Application.Run(context);
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            LogException("application-run", ex);
+            throw;
+        }
+    }
+
+    private static void InstallExceptionLogging()
+    {
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.ThreadException += (_, e) => LogException("winforms-thread", e.Exception);
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+        {
+            var exception = e.ExceptionObject as Exception;
+            LogException("appdomain-unhandled", exception, $"IsTerminating: {e.IsTerminating}");
+        };
+        TaskScheduler.UnobservedTaskException += (_, e) =>
+        {
+            LogException("task-unobserved", e.Exception);
+            e.SetObserved();
+        };
+    }
+
+    private static void LogMessage(string source, string message)
+    {
+        WriteLog(source, message);
+    }
+
+    private static void LogException(string source, Exception? exception, string? details = null)
+    {
+        var builder = new StringBuilder();
+        if (!string.IsNullOrWhiteSpace(details))
+        {
+            builder.AppendLine(details);
+        }
+
+        builder.AppendLine(exception?.ToString() ?? "(non-Exception object)");
+        WriteLog(source, builder.ToString());
+    }
+
+    private static void WriteLog(string source, string message)
+    {
+        try
+        {
+            Directory.CreateDirectory(LogDirectory);
+            CleanupOldLogs();
+            var path = Path.Combine(LogDirectory, $"RestartableLaunch-{DateTime.Now:yyyy-MM-dd}.log");
+            var entry = new StringBuilder()
+                .AppendLine($"[{DateTimeOffset.Now:O}] {source}")
+                .AppendLine(message.TrimEnd())
+                .AppendLine()
+                .ToString();
+
+            lock (LogLock)
+            {
+                File.AppendAllText(path, entry, Encoding.UTF8);
+            }
+        }
+        catch
+        {
+            // Logging must never become another source of crashes.
+        }
+    }
+
+    private static void CleanupOldLogs()
+    {
+        try
+        {
+            foreach (var file in Directory.EnumerateFiles(LogDirectory, "RestartableLaunch-*.log"))
+            {
+                if (File.GetLastWriteTimeUtc(file) < DateTime.UtcNow.AddDays(-21))
+                {
+                    File.Delete(file);
+                }
+            }
+        }
+        catch
+        {
+            // Best-effort cleanup only.
+        }
     }
 
     private static async Task StartPipeServer(ManagerContext context)
@@ -802,6 +888,8 @@ internal static partial class Program
     private static string ActiveStatePath => Path.Combine(AppDataDirectory, "active.json");
 
     private static string IconCacheDirectory => Path.Combine(AppDataDirectory, "icons");
+
+    private static string LogDirectory => Path.Combine(AppDataDirectory, "logs");
 
     private static class ExplorerContextMenu
     {
