@@ -303,6 +303,56 @@ internal static partial class Program
 
     private static string ActiveStatePath => Path.Combine(AppDataDirectory, "active.json");
 
+    private static class ExplorerContextMenu
+    {
+        private static readonly string[] ContextMenuSubkeys =
+        [
+            @"Software\Classes\*\shell\RestartableLaunch",
+            @"Software\Classes\Directory\shell\RestartableLaunch",
+            @"Software\Classes\Drive\shell\RestartableLaunch",
+        ];
+
+        public static bool IsRegistered()
+        {
+            var expectedCommand = GetCommandValue();
+
+            return ContextMenuSubkeys.All(subkey =>
+            {
+                using var key = Registry.CurrentUser.OpenSubKey(subkey);
+                using var commandKey = Registry.CurrentUser.OpenSubKey(subkey + @"\command");
+                return string.Equals(key?.GetValue("") as string, "RestartableLaunch", StringComparison.Ordinal)
+                    && string.Equals(key?.GetValue("Icon") as string, QuoteArgument(Application.ExecutablePath), StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(commandKey?.GetValue("") as string, expectedCommand, StringComparison.OrdinalIgnoreCase);
+            });
+        }
+
+        public static void Register()
+        {
+            foreach (var subkey in ContextMenuSubkeys)
+            {
+                using var key = Registry.CurrentUser.CreateSubKey(subkey);
+                key.SetValue("", "RestartableLaunch", RegistryValueKind.String);
+                key.SetValue("Icon", QuoteArgument(Application.ExecutablePath), RegistryValueKind.String);
+
+                using var commandKey = key.CreateSubKey("command");
+                commandKey.SetValue("", GetCommandValue(), RegistryValueKind.String);
+            }
+        }
+
+        public static void Unregister()
+        {
+            foreach (var subkey in ContextMenuSubkeys)
+            {
+                Registry.CurrentUser.DeleteSubKeyTree(subkey, throwOnMissingSubKey: false);
+            }
+        }
+
+        private static string GetCommandValue()
+        {
+            return $"{QuoteArgument(Application.ExecutablePath)} \"%1\"";
+        }
+    }
+
     private static string ReadActiveStateList()
     {
         if (!File.Exists(ActiveStatePath))
@@ -692,6 +742,8 @@ internal static partial class Program
     {
         private readonly ManagerContext context;
         private readonly ListView listView = new();
+        private readonly CheckBox explorerMenuCheckBox = new();
+        private bool updatingExplorerMenuCheckBox;
 
         public MainForm(ManagerContext context)
         {
@@ -702,6 +754,18 @@ internal static partial class Program
             Height = 420;
             StartPosition = FormStartPosition.CenterScreen;
 
+            var topPanel = new Panel
+            {
+                Dock = DockStyle.Top,
+                Height = 42,
+                Padding = new Padding(12, 10, 12, 6),
+            };
+
+            explorerMenuCheckBox.AutoSize = true;
+            explorerMenuCheckBox.Text = "RestartableLaunch in Explorer context menu";
+            explorerMenuCheckBox.CheckedChanged += (_, _) => ToggleExplorerContextMenu();
+            topPanel.Controls.Add(explorerMenuCheckBox);
+
             listView.Dock = DockStyle.Fill;
             listView.View = View.Details;
             listView.FullRowSelect = true;
@@ -711,12 +775,15 @@ internal static partial class Program
             listView.Columns.Add("Command line", 520);
             listView.Columns.Add("Desktop", 240);
             Controls.Add(listView);
+            Controls.Add(topPanel);
 
             FormClosing += (_, e) =>
             {
                 e.Cancel = true;
                 Hide();
             };
+
+            RefreshExplorerContextMenuState();
         }
 
         public void RefreshApps()
@@ -734,6 +801,47 @@ internal static partial class Program
             }
 
             listView.EndUpdate();
+        }
+
+        private void RefreshExplorerContextMenuState()
+        {
+            updatingExplorerMenuCheckBox = true;
+            try
+            {
+                explorerMenuCheckBox.Checked = ExplorerContextMenu.IsRegistered();
+            }
+            finally
+            {
+                updatingExplorerMenuCheckBox = false;
+            }
+        }
+
+        private void ToggleExplorerContextMenu()
+        {
+            if (updatingExplorerMenuCheckBox)
+            {
+                return;
+            }
+
+            try
+            {
+                if (explorerMenuCheckBox.Checked)
+                {
+                    ExplorerContextMenu.Register();
+                }
+                else
+                {
+                    ExplorerContextMenu.Unregister();
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox(IntPtr.Zero, ex.Message, "RestartableLaunch", 0x10);
+            }
+            finally
+            {
+                RefreshExplorerContextMenuState();
+            }
         }
     }
 

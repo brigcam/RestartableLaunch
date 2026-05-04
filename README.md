@@ -39,7 +39,8 @@ RestartableLaunch.exe --list
 ```
 
 The GUI window also lists the currently monitored applications and their command
-lines.
+lines. It also includes a checkbox to register or unregister RestartableLaunch
+in Explorer's context menu for the current user.
 
 ## Explorer context menu
 
