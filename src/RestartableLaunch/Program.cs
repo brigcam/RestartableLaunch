@@ -286,6 +286,159 @@ internal static partial class Program
         return result;
     }
 
+    private static List<WindowCandidate> GetOpenWindowCandidates()
+    {
+        var currentProcessId = Environment.ProcessId;
+        var shellWindow = GetShellWindow();
+        var candidates = new List<WindowCandidate>();
+
+        EnumWindows((window, _) =>
+        {
+            if (window == shellWindow || !IsWindowVisible(window))
+            {
+                return true;
+            }
+
+            GetWindowThreadProcessId(window, out var processId);
+            if (processId == currentProcessId)
+            {
+                return true;
+            }
+
+            var title = GetWindowTitle(window);
+            if (string.IsNullOrWhiteSpace(title))
+            {
+                return true;
+            }
+
+            try
+            {
+                using var process = Process.GetProcessById(processId);
+                candidates.Add(new WindowCandidate(window, processId, process.ProcessName, title));
+            }
+            catch
+            {
+                // Ignore windows whose process disappears while enumerating.
+            }
+
+            return true;
+        }, IntPtr.Zero);
+
+        return candidates
+            .OrderBy(static candidate => candidate.ProcessName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(static candidate => candidate.Title, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static string GetWindowTitle(IntPtr window)
+    {
+        var length = GetWindowTextLength(window);
+        if (length <= 0)
+        {
+            return string.Empty;
+        }
+
+        var builder = new StringBuilder(length + 1);
+        GetWindowText(window, builder, builder.Capacity);
+        return builder.ToString();
+    }
+
+    private static WindowBounds? TryGetWindowBounds(IntPtr window)
+    {
+        if (window == IntPtr.Zero || !GetWindowRect(window, out var rect))
+        {
+            return null;
+        }
+
+        var width = rect.Right - rect.Left;
+        var height = rect.Bottom - rect.Top;
+        return width > 0 && height > 0
+            ? new WindowBounds(rect.Left, rect.Top, width, height)
+            : null;
+    }
+
+    private static void TryMoveWindow(IntPtr window, WindowBounds? bounds)
+    {
+        if (window == IntPtr.Zero || bounds is null)
+        {
+            return;
+        }
+
+        MoveWindow(window, bounds.Left, bounds.Top, bounds.Width, bounds.Height, true);
+    }
+
+    private static LaunchRequest? TryCreateRequestFromProcess(Process process)
+    {
+        var commandLine = TryGetProcessCommandLine(process.Id);
+        var args = string.IsNullOrWhiteSpace(commandLine) ? [] : CommandLineToArguments(commandLine);
+
+        if (args.Length > 0)
+        {
+            return new LaunchRequest(args[0], args.Skip(1).ToArray(), null, LaunchKind.Executable, null);
+        }
+
+        try
+        {
+            return new LaunchRequest(process.MainModule?.FileName ?? process.ProcessName, [], null, LaunchKind.Executable, null);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string? TryGetProcessCommandLine(int processId)
+    {
+        try
+        {
+            var wmiType = Type.GetTypeFromProgID("WbemScripting.SWbemLocator");
+            if (wmiType is null)
+            {
+                return null;
+            }
+
+            dynamic locator = Activator.CreateInstance(wmiType)!;
+            dynamic service = locator.ConnectServer(".", "root\\cimv2");
+            dynamic results = service.ExecQuery($"SELECT CommandLine FROM Win32_Process WHERE ProcessId = {processId}");
+
+            foreach (dynamic result in results)
+            {
+                return result.CommandLine as string;
+            }
+        }
+        catch
+        {
+            return null;
+        }
+
+        return null;
+    }
+
+    private static string[] CommandLineToArguments(string commandLine)
+    {
+        var argv = CommandLineToArgvW(commandLine, out var argc);
+        if (argv == IntPtr.Zero || argc <= 0)
+        {
+            return [];
+        }
+
+        try
+        {
+            var args = new string[argc];
+            for (var i = 0; i < argc; i++)
+            {
+                var pointer = Marshal.ReadIntPtr(argv, i * IntPtr.Size);
+                args[i] = Marshal.PtrToStringUni(pointer) ?? string.Empty;
+            }
+
+            return args;
+        }
+        finally
+        {
+            LocalFree(argv);
+        }
+    }
+
     private static string AppDataDirectory
     {
         get
@@ -475,7 +628,39 @@ internal static partial class Program
     [LibraryImport("user32.dll")]
     private static partial uint GetWindowThreadProcessId(IntPtr hWnd, out int processId);
 
+    [LibraryImport("user32.dll")]
+    private static partial IntPtr GetShellWindow();
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowTextW", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+    [LibraryImport("user32.dll", EntryPoint = "GetWindowTextLengthW", StringMarshalling = StringMarshalling.Utf16)]
+    private static partial int GetWindowTextLength(IntPtr hWnd);
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool GetWindowRect(IntPtr hWnd, out NativeRect lpRect);
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool MoveWindow(IntPtr hWnd, int x, int y, int nWidth, int nHeight, [MarshalAs(UnmanagedType.Bool)] bool repaint);
+
+    [LibraryImport("shell32.dll", EntryPoint = "CommandLineToArgvW", StringMarshalling = StringMarshalling.Utf16)]
+    private static partial IntPtr CommandLineToArgvW(string lpCmdLine, out int pNumArgs);
+
+    [LibraryImport("kernel32.dll")]
+    private static partial IntPtr LocalFree(IntPtr hMem);
+
     private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeRect
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
 
     [ComImport]
     [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -581,13 +766,50 @@ internal static partial class Program
                     : StartExecutable(request);
                 process.EnableRaisingEvents = true;
 
-                var app = new MonitoredApp(request, process, DateTimeOffset.Now, null);
+                var app = new MonitoredApp(request, process, DateTimeOffset.Now, null, null);
                 apps.Add(app);
                 process.Exited += (_, _) => Post(() => Remove(app));
 
                 SaveSession();
                 mainForm.RefreshApps();
-                _ = TrackWindowPlacementAsync(app, request.DesktopId);
+                _ = TrackWindowPlacementAsync(app, request.DesktopId, request.WindowBounds);
+            }
+            catch (Exception ex)
+            {
+                MessageBox(IntPtr.Zero, ex.Message, "RestartableLaunch", 0x10);
+            }
+        }
+
+        public void AdoptWindow(WindowCandidate candidate)
+        {
+            try
+            {
+                if (apps.Any(app => !app.Process.HasExited && app.Process.Id == candidate.ProcessId))
+                {
+                    MessageBox(IntPtr.Zero, "That process is already monitored.", "RestartableLaunch", 0x40);
+                    return;
+                }
+
+                var process = Process.GetProcessById(candidate.ProcessId);
+                var request = TryCreateRequestFromProcess(process);
+                if (request is null)
+                {
+                    process.Dispose();
+                    MessageBox(IntPtr.Zero, "Could not read a restartable command line for that window.", "RestartableLaunch", 0x10);
+                    return;
+                }
+
+                var desktopId = VirtualDesktopPlacement.TryGetDesktopId(candidate.Handle);
+                var bounds = TryGetWindowBounds(candidate.Handle);
+                request = request with { DesktopId = desktopId, WindowBounds = bounds };
+
+                process.EnableRaisingEvents = true;
+                var app = new MonitoredApp(request, process, DateTimeOffset.Now, desktopId, bounds);
+                apps.Add(app);
+                process.Exited += (_, _) => Post(() => Remove(app));
+
+                SaveSession();
+                mainForm.RefreshApps();
             }
             catch (Exception ex)
             {
@@ -706,7 +928,7 @@ internal static partial class Program
 
         private void SaveSession()
         {
-            var session = new SavedSession(apps.Select(static app => app.Request with { DesktopId = app.DesktopId }).ToArray());
+            var session = new SavedSession(apps.Select(static app => app.Request with { DesktopId = app.DesktopId, WindowBounds = app.WindowBounds }).ToArray());
             File.WriteAllText(SessionPath, JsonSerializer.Serialize(session, JsonOptions));
             SaveActiveState();
         }
@@ -716,13 +938,14 @@ internal static partial class Program
             var state = new ActiveState(apps.Select(static app => new ActiveAppState(
                 app.Process.Id,
                 app.StartedAt,
-                app.Request with { DesktopId = app.DesktopId },
-                app.DesktopId)).ToArray());
+                app.Request with { DesktopId = app.DesktopId, WindowBounds = app.WindowBounds },
+                app.DesktopId,
+                app.WindowBounds)).ToArray());
 
             File.WriteAllText(ActiveStatePath, JsonSerializer.Serialize(state, JsonOptions));
         }
 
-        private async Task TrackWindowPlacementAsync(MonitoredApp app, Guid? restoreDesktopId)
+        private async Task TrackWindowPlacementAsync(MonitoredApp app, Guid? restoreDesktopId, WindowBounds? restoreBounds)
         {
             try
             {
@@ -738,6 +961,8 @@ internal static partial class Program
                     VirtualDesktopPlacement.TryMoveToDesktop(window, targetDesktopId);
                 }
 
+                TryMoveWindow(window, restoreBounds);
+
                 await Task.Delay(500, cancellation.Token);
                 var currentDesktopId = VirtualDesktopPlacement.TryGetDesktopId(window) ?? restoreDesktopId;
                 if (currentDesktopId is null)
@@ -748,6 +973,7 @@ internal static partial class Program
                 Post(() =>
                 {
                     app.DesktopId = currentDesktopId;
+                    app.WindowBounds = TryGetWindowBounds(window) ?? restoreBounds;
                     SaveSession();
                     mainForm.RefreshApps();
                 });
@@ -769,6 +995,7 @@ internal static partial class Program
     {
         private readonly ManagerContext context;
         private readonly ListView listView = new();
+        private readonly Button addWindowButton = new();
         private readonly CheckBox startupCheckBox = new();
         private readonly CheckBox explorerMenuCheckBox = new();
         private bool updatingStartupCheckBox;
@@ -801,6 +1028,17 @@ internal static partial class Program
             explorerMenuCheckBox.Location = new Point(0, 26);
             explorerMenuCheckBox.CheckedChanged += (_, _) => ToggleExplorerContextMenu();
             topPanel.Controls.Add(explorerMenuCheckBox);
+
+            addWindowButton.Text = "Add open window...";
+            addWindowButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            addWindowButton.Size = new Size(140, 28);
+            addWindowButton.Location = new Point(topPanel.Width - addWindowButton.Width - 12, 17);
+            addWindowButton.Click += (_, _) => AddOpenWindow();
+            topPanel.Controls.Add(addWindowButton);
+            topPanel.Resize += (_, _) =>
+            {
+                addWindowButton.Location = new Point(topPanel.ClientSize.Width - addWindowButton.Width - 12, 17);
+            };
 
             listView.Dock = DockStyle.Fill;
             listView.View = View.Details;
@@ -850,6 +1088,15 @@ internal static partial class Program
             finally
             {
                 updatingExplorerMenuCheckBox = false;
+            }
+        }
+
+        private void AddOpenWindow()
+        {
+            using var dialog = new WindowPickerForm();
+            if (dialog.ShowDialog(this) == DialogResult.OK && dialog.SelectedWindow is { } selectedWindow)
+            {
+                context.AdoptWindow(selectedWindow);
             }
         }
 
@@ -923,6 +1170,89 @@ internal static partial class Program
         }
     }
 
+    private sealed class WindowPickerForm : Form
+    {
+        private readonly ListView listView = new();
+        private readonly Button okButton = new();
+        private readonly Button cancelButton = new();
+        private readonly List<WindowCandidate> candidates;
+
+        public WindowPickerForm()
+        {
+            Text = "Add Open Window";
+            Icon = CloneAppIcon();
+            Width = 760;
+            Height = 420;
+            StartPosition = FormStartPosition.CenterParent;
+            MinimizeBox = false;
+            MaximizeBox = false;
+
+            candidates = GetOpenWindowCandidates();
+
+            listView.Dock = DockStyle.Fill;
+            listView.View = View.Details;
+            listView.FullRowSelect = true;
+            listView.GridLines = true;
+            listView.Columns.Add("Process", 160);
+            listView.Columns.Add("PID", 80);
+            listView.Columns.Add("Window title", 480);
+            listView.DoubleClick += (_, _) => AcceptSelection();
+
+            foreach (var candidate in candidates)
+            {
+                var item = new ListViewItem(candidate.ProcessName);
+                item.SubItems.Add(candidate.ProcessId.ToString());
+                item.SubItems.Add(candidate.Title);
+                item.Tag = candidate;
+                listView.Items.Add(item);
+            }
+
+            var buttonPanel = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Bottom,
+                Height = 44,
+                FlowDirection = FlowDirection.RightToLeft,
+                Padding = new Padding(8),
+            };
+
+            okButton.Text = "Add";
+            okButton.Width = 90;
+            okButton.Click += (_, _) => AcceptSelection();
+            cancelButton.Text = "Cancel";
+            cancelButton.Width = 90;
+            cancelButton.Click += (_, _) => DialogResult = DialogResult.Cancel;
+
+            buttonPanel.Controls.Add(okButton);
+            buttonPanel.Controls.Add(cancelButton);
+
+            Controls.Add(listView);
+            Controls.Add(buttonPanel);
+
+            if (listView.Items.Count > 0)
+            {
+                listView.Items[0].Selected = true;
+            }
+        }
+
+        public WindowCandidate? SelectedWindow { get; private set; }
+
+        private void AcceptSelection()
+        {
+            if (listView.SelectedItems.Count == 0)
+            {
+                return;
+            }
+
+            if (listView.SelectedItems[0].Tag is not WindowCandidate candidate)
+            {
+                return;
+            }
+
+            SelectedWindow = candidate;
+            DialogResult = DialogResult.OK;
+        }
+    }
+
     private sealed record AppCommand(LaunchRequest? Launch, bool Restore, CommandMode Mode)
     {
         public static AppCommand Parse(string[] args)
@@ -978,8 +1308,8 @@ internal static partial class Program
             }
 
             var request = launchKind == LaunchKind.Executable
-                ? new LaunchRequest(args[executableIndex], args.Skip(executableIndex + 1).ToArray(), null, LaunchKind.Executable)
-                : new LaunchRequest(args[executableIndex], [], null, LaunchKind.DefaultOpen);
+                ? new LaunchRequest(args[executableIndex], args.Skip(executableIndex + 1).ToArray(), null, LaunchKind.Executable, null)
+                : new LaunchRequest(args[executableIndex], [], null, LaunchKind.DefaultOpen, null);
 
             return new AppCommand(request, false, CommandMode.Launch);
         }
@@ -1003,16 +1333,22 @@ internal static partial class Program
         DefaultOpen,
     }
 
-    private sealed record LaunchRequest(string Executable, string[] Arguments, Guid? DesktopId, LaunchKind Kind);
+    private sealed record LaunchRequest(string Executable, string[] Arguments, Guid? DesktopId, LaunchKind Kind, WindowBounds? WindowBounds);
 
     private sealed record SavedSession(LaunchRequest[] Apps);
 
     private sealed record ActiveState(ActiveAppState[] Apps);
 
-    private sealed record ActiveAppState(int ProcessId, DateTimeOffset StartedAt, LaunchRequest Request, Guid? DesktopId);
+    private sealed record ActiveAppState(int ProcessId, DateTimeOffset StartedAt, LaunchRequest Request, Guid? DesktopId, WindowBounds? WindowBounds);
 
-    private sealed record MonitoredApp(LaunchRequest Request, Process Process, DateTimeOffset StartedAt, Guid? DesktopId)
+    private sealed record MonitoredApp(LaunchRequest Request, Process Process, DateTimeOffset StartedAt, Guid? DesktopId, WindowBounds? WindowBounds)
     {
         public Guid? DesktopId { get; set; } = DesktopId;
+
+        public WindowBounds? WindowBounds { get; set; } = WindowBounds;
     }
+
+    private sealed record WindowBounds(int Left, int Top, int Width, int Height);
+
+    private sealed record WindowCandidate(IntPtr Handle, int ProcessId, string ProcessName, string Title);
 }

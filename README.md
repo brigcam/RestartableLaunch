@@ -43,6 +43,10 @@ lines. It also includes checkboxes to start RestartableLaunch at user logon and
 to register or unregister RestartableLaunch in Explorer's context menu for the
 current user.
 
+Use **Add open window...** to choose a currently open window and make it
+restartable. RestartableLaunch reads the owning process command line, remembers
+the window position and virtual desktop when available, and starts monitoring it.
+
 ## Explorer context menu
 
 RestartableLaunch can be added to Explorer's context menu for files, folders,
