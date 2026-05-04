@@ -13,6 +13,7 @@ internal static partial class Program
     private const int RestartNoHang = 2;
     private const string MutexName = @"Local\RestartableLaunch.Manager";
     private const string PipeName = "RestartableLaunch.Manager";
+    private const int SwHide = 0;
 
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
@@ -26,9 +27,22 @@ internal static partial class Program
 
         if (!isFirstInstance)
         {
-            SendToExistingInstance(command);
+            var response = SendToExistingInstance(command);
+            if (command.Mode == CommandMode.List)
+            {
+                Console.WriteLine(response.Length == 0 ? "RestartableLaunch is running, but no response was returned." : response);
+            }
+
             return 0;
         }
+
+        if (command.Mode == CommandMode.List)
+        {
+            Console.WriteLine("No applications are currently monitored by RestartableLaunch.");
+            return 0;
+        }
+
+        HideConsoleWindow();
 
         var context = new ManagerContext();
         RegisterApplicationRestart("--restore", RestartNoCrash | RestartNoHang);
@@ -43,7 +57,7 @@ internal static partial class Program
             context.Launch(command.Launch);
         }
 
-        if (command.ShowWindow || command.Launch is null)
+        if (command.Mode == CommandMode.ShowGui || command.Launch is null)
         {
             context.ShowMainWindow();
         }
@@ -59,13 +73,25 @@ internal static partial class Program
         {
             try
             {
-                await using var pipe = new NamedPipeServerStream(PipeName, PipeDirection.In, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+                await using var pipe = new NamedPipeServerStream(PipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
                 await pipe.WaitForConnectionAsync();
                 using var reader = new StreamReader(pipe, Encoding.UTF8);
-                var json = await reader.ReadToEndAsync();
+                var json = await reader.ReadLineAsync();
+                if (string.IsNullOrWhiteSpace(json))
+                {
+                    continue;
+                }
+
                 var command = JsonSerializer.Deserialize<AppCommand>(json, JsonOptions);
                 if (command is null)
                 {
+                    continue;
+                }
+
+                if (command.Mode == CommandMode.List)
+                {
+                    using var writer = new StreamWriter(pipe, Encoding.UTF8) { AutoFlush = true };
+                    writer.Write(FormatApps(context.Apps));
                     continue;
                 }
 
@@ -76,7 +102,7 @@ internal static partial class Program
                         context.Launch(command.Launch);
                     }
 
-                    if (command.ShowWindow || command.Launch is null)
+                    if (command.Mode == CommandMode.ShowGui || command.Launch is null)
                     {
                         context.ShowMainWindow();
                     }
@@ -89,18 +115,33 @@ internal static partial class Program
         }
     }
 
-    private static void SendToExistingInstance(AppCommand command)
+    private static string SendToExistingInstance(AppCommand command)
     {
         try
         {
-            using var pipe = new NamedPipeClientStream(".", PipeName, PipeDirection.Out);
+            using var pipe = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut);
             pipe.Connect(1500);
-            using var writer = new StreamWriter(pipe, Encoding.UTF8);
-            writer.Write(JsonSerializer.Serialize(command, JsonOptions));
+            using var writer = new StreamWriter(pipe, Encoding.UTF8) { AutoFlush = true };
+            writer.WriteLine(JsonSerializer.Serialize(command, JsonOptions));
+            pipe.WaitForPipeDrain();
+
+            if (command.Mode != CommandMode.List)
+            {
+                return string.Empty;
+            }
+
+            using var reader = new StreamReader(pipe, Encoding.UTF8);
+            return reader.ReadToEnd();
         }
-        catch
+        catch (Exception ex)
         {
-            MessageBox(IntPtr.Zero, "RestartableLaunch is already running, but it did not respond.", "RestartableLaunch", 0x10);
+            if (command.Mode == CommandMode.List)
+            {
+                return $"RestartableLaunch is already running, but it did not respond: {ex.Message}";
+            }
+
+            MessageBox(IntPtr.Zero, $"RestartableLaunch is already running, but it did not respond: {ex.Message}", "RestartableLaunch", 0x10);
+            return string.Empty;
         }
     }
 
@@ -146,6 +187,37 @@ internal static partial class Program
         return string.Join(' ', new[] { executable }.Concat(arguments).Select(QuoteArgument));
     }
 
+    private static string FormatApps(IReadOnlyList<MonitoredApp> apps)
+    {
+        if (apps.Count == 0)
+        {
+            return "No applications are currently monitored by RestartableLaunch.";
+        }
+
+        var builder = new StringBuilder();
+        builder.AppendLine("Applications monitored by RestartableLaunch:");
+        builder.AppendLine();
+
+        foreach (var app in apps)
+        {
+            builder.AppendLine($"PID:     {app.Process.Id}");
+            builder.AppendLine($"Started: {app.StartedAt.LocalDateTime:yyyy-MM-dd HH:mm:ss}");
+            builder.AppendLine($"Command: {FormatCommand(app.Request.Executable, app.Request.Arguments)}");
+            builder.AppendLine();
+        }
+
+        return builder.ToString().TrimEnd();
+    }
+
+    private static void HideConsoleWindow()
+    {
+        var consoleWindow = GetConsoleWindow();
+        if (consoleWindow != IntPtr.Zero)
+        {
+            ShowWindow(consoleWindow, SwHide);
+        }
+    }
+
     private static string AppDataDirectory
     {
         get
@@ -180,6 +252,13 @@ internal static partial class Program
 
     [LibraryImport("user32.dll", EntryPoint = "MessageBoxW", StringMarshalling = StringMarshalling.Utf16)]
     private static partial int MessageBox(IntPtr hWnd, string text, string caption, uint type);
+
+    [LibraryImport("kernel32.dll")]
+    private static partial IntPtr GetConsoleWindow();
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
     private sealed class ManagerContext : ApplicationContext
     {
@@ -373,23 +452,28 @@ internal static partial class Program
         }
     }
 
-    private sealed record AppCommand(LaunchRequest? Launch, bool Restore, bool ShowWindow)
+    private sealed record AppCommand(LaunchRequest? Launch, bool Restore, CommandMode Mode)
     {
         public static AppCommand Parse(string[] args)
         {
             if (args.Length == 0)
             {
-                return new AppCommand(null, false, true);
+                return new AppCommand(null, false, CommandMode.ShowGui);
             }
 
             if (Is(args[0], "--restore"))
             {
-                return new AppCommand(null, true, false);
+                return new AppCommand(null, true, CommandMode.Launch);
             }
 
-            if (Is(args[0], "--list") || Is(args[0], "-l") || Is(args[0], "--gui"))
+            if (Is(args[0], "--list") || Is(args[0], "-l"))
             {
-                return new AppCommand(null, false, true);
+                return new AppCommand(null, false, CommandMode.List);
+            }
+
+            if (Is(args[0], "--gui"))
+            {
+                return new AppCommand(null, false, CommandMode.ShowGui);
             }
 
             var executableIndex = 0;
@@ -411,17 +495,24 @@ internal static partial class Program
 
             if (executableIndex >= args.Length)
             {
-                return new AppCommand(null, false, true);
+                return new AppCommand(null, false, CommandMode.ShowGui);
             }
 
             var request = new LaunchRequest(args[executableIndex], args.Skip(executableIndex + 1).ToArray());
-            return new AppCommand(request, false, false);
+            return new AppCommand(request, false, CommandMode.Launch);
         }
 
         private static bool Is(string left, string right)
         {
             return string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
         }
+    }
+
+    private enum CommandMode
+    {
+        Launch,
+        ShowGui,
+        List,
     }
 
     private sealed record LaunchRequest(string Executable, string[] Arguments);

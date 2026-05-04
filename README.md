@@ -29,14 +29,17 @@ is passed to the wrapped application.
 
 ## Tray UI
 
-Run the executable without arguments, or use `--list`, `-l`, or `--gui` to show
-the tray manager window:
+Run the executable without arguments, or use `--gui`, to open or reopen the tray
+manager window.
+
+Use `--list` or `-l` to print the monitored applications to the console:
 
 ```powershell
 RestartableLaunch.exe --list
 ```
 
-The window lists the currently monitored applications and their command lines.
+The GUI window also lists the currently monitored applications and their command
+lines.
 
 ## Notes
 
