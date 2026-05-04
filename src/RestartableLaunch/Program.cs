@@ -1064,8 +1064,15 @@ internal static partial class Program
         {
             try
             {
-                if (apps.Any(app => !app.Process.HasExited && app.Process.Id == candidate.ProcessId))
+                var existingApp = apps.FirstOrDefault(app => !app.Process.HasExited && app.Process.Id == candidate.ProcessId);
+                if (existingApp is not null)
                 {
+                    if (monitorAllInstances)
+                    {
+                        MonitorAllInstances(existingApp);
+                        return;
+                    }
+
                     MessageBox(IntPtr.Zero, "That process is already monitored.", "RestartableLaunch", 0x40);
                     return;
                 }
@@ -1095,6 +1102,27 @@ internal static partial class Program
                     ScanMonitorRules(save: false);
                 }
 
+                SaveSession();
+                mainForm.RefreshApps();
+            }
+            catch (Exception ex)
+            {
+                MessageBox(IntPtr.Zero, ex.Message, "RestartableLaunch", 0x10);
+            }
+        }
+
+        public void MonitorAllInstances(MonitoredApp app)
+        {
+            try
+            {
+                if (app.Process.HasExited)
+                {
+                    return;
+                }
+
+                var rule = EnsureMonitorRule(app.Process);
+                app.RuleId = rule.Id;
+                ScanMonitorRules(save: false);
                 SaveSession();
                 mainForm.RefreshApps();
             }
@@ -1846,10 +1874,30 @@ internal static partial class Program
         private ContextMenuStrip BuildListContextMenu()
         {
             var menu = new ContextMenuStrip();
+            var monitorAllItem = new ToolStripMenuItem();
             menu.Opening += (_, e) =>
             {
                 e.Cancel = listView.SelectedItems.Count == 0;
+                if (e.Cancel)
+                {
+                    return;
+                }
+
+                var selectedApp = GetSelectedMonitoredApp();
+                monitorAllItem.Visible = selectedApp is not null && selectedApp.RuleId is null;
+                monitorAllItem.Text = selectedApp is null
+                    ? "Monitor all instances"
+                    : $"Monitor all instances of {selectedApp.Process.ProcessName}.exe";
             };
+            monitorAllItem.Click += (_, _) =>
+            {
+                if (GetSelectedMonitoredApp() is { } app)
+                {
+                    context.MonitorAllInstances(app);
+                }
+            };
+            menu.Items.Add(monitorAllItem);
+            menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Remove", null, (_, _) => RemoveSelectedApps());
             return menu;
         }
@@ -1885,6 +1933,15 @@ internal static partial class Program
             }
 
             context.RemoveItems(selectedItems);
+        }
+
+        private MonitoredApp? GetSelectedMonitoredApp()
+        {
+            return listView.SelectedItems
+                .Cast<ListViewItem>()
+                .Select(static item => item.Tag)
+                .OfType<MonitoredApp>()
+                .FirstOrDefault();
         }
 
         private void RefreshExplorerContextMenuState()
@@ -2012,6 +2069,7 @@ internal static partial class Program
             listView.Columns.Add("PID", 80);
             listView.Columns.Add("Window title", 450);
             listView.DoubleClick += (_, _) => AcceptSelection();
+            listView.ContextMenuStrip = BuildContextMenu();
 
             foreach (var candidate in candidates)
             {
@@ -2069,6 +2127,39 @@ internal static partial class Program
 
         public bool MonitorAllInstances => monitorAllInstancesCheckBox.Checked;
 
+        private ContextMenuStrip BuildContextMenu()
+        {
+            var menu = new ContextMenuStrip();
+            var monitorAllItem = new ToolStripMenuItem();
+            menu.Opening += (_, e) =>
+            {
+                e.Cancel = listView.SelectedItems.Count == 0;
+                if (e.Cancel)
+                {
+                    return;
+                }
+
+                var candidate = GetSelectedCandidate();
+                monitorAllItem.Text = candidate is null
+                    ? "Monitor all instances"
+                    : $"Monitor all instances of {candidate.ProcessName}.exe";
+            };
+
+            monitorAllItem.Click += (_, _) =>
+            {
+                if (GetSelectedCandidate() is null)
+                {
+                    return;
+                }
+
+                monitorAllInstancesCheckBox.Checked = true;
+                AcceptSelection();
+            };
+
+            menu.Items.Add(monitorAllItem);
+            return menu;
+        }
+
         private void AcceptSelection()
         {
             if (listView.SelectedItems.Count == 0)
@@ -2083,6 +2174,13 @@ internal static partial class Program
 
             SelectedWindow = candidate;
             DialogResult = DialogResult.OK;
+        }
+
+        private WindowCandidate? GetSelectedCandidate()
+        {
+            return listView.SelectedItems.Count > 0 && listView.SelectedItems[0].Tag is WindowCandidate candidate
+                ? candidate
+                : null;
         }
     }
 
