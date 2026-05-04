@@ -1379,7 +1379,7 @@ internal static partial class Program
                 var imageKey = $"window-{candidate.Handle.ToInt64()}";
                 using (var icon = TryGetWindowIcon(candidate.Handle, candidate.ProcessId))
                 {
-                    windowIcons.Images.Add(imageKey, icon);
+                    windowIcons.Images.Add(imageKey, icon.ToBitmap());
                 }
 
                 var item = new ListViewItem(string.Empty)
