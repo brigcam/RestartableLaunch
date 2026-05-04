@@ -9,23 +9,23 @@ This is useful for applications that do not register themselves as restartable.
 ## Usage
 
 ```powershell
-RestartableLaunch.exe "C:\Path\App.exe" [arguments...]
+RestartableLaunch.exe "C:\Path\Object"
 ```
 
 Example:
 
 ```powershell
-RestartableLaunch.exe "C:\Program Files\Aegisub\aegisub.exe" "C:\Subtitles\episode.ass"
+RestartableLaunch.exe "C:\Subtitles\episode.ass"
 ```
 
-An explicit separator is also accepted:
+RestartableLaunch opens the object with its default Explorer action and monitors
+the launched process when Windows returns one.
+
+To launch a specific executable with arguments instead, use `--exec`:
 
 ```powershell
-RestartableLaunch.exe -- "C:\Path\App.exe" [arguments...]
+RestartableLaunch.exe --exec "C:\Path\App.exe" [arguments...]
 ```
-
-The first non-option argument is treated as the executable. Everything after it
-is passed to the wrapped application.
 
 ## Tray UI
 
@@ -40,6 +40,18 @@ RestartableLaunch.exe --list
 
 The GUI window also lists the currently monitored applications and their command
 lines.
+
+## Explorer context menu
+
+RestartableLaunch can be added to Explorer's context menu for files, folders,
+and drives. The menu command should invoke:
+
+```powershell
+RestartableLaunch.exe "%1"
+```
+
+This opens the selected object with its default Explorer action and records that
+default-open request for restart.
 
 ## Virtual desktops
 

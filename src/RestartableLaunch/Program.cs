@@ -185,6 +185,13 @@ internal static partial class Program
         return string.Join(' ', new[] { executable }.Concat(arguments).Select(QuoteArgument));
     }
 
+    private static string FormatRequest(LaunchRequest request)
+    {
+        return request.Kind == LaunchKind.DefaultOpen
+            ? $"default-open {QuoteArgument(request.Executable)}"
+            : FormatCommand(request.Executable, request.Arguments);
+    }
+
     private static string FormatApps(IReadOnlyList<MonitoredApp> apps)
     {
         if (apps.Count == 0)
@@ -200,7 +207,7 @@ internal static partial class Program
         {
             builder.AppendLine($"PID:     {app.Process.Id}");
             builder.AppendLine($"Started: {app.StartedAt.LocalDateTime:yyyy-MM-dd HH:mm:ss}");
-            builder.AppendLine($"Command: {FormatCommand(app.Request.Executable, app.Request.Arguments)}");
+            builder.AppendLine($"Command: {FormatRequest(app.Request)}");
             builder.AppendLine($"Desktop: {(app.DesktopId is null ? "unknown" : app.DesktopId)}");
             builder.AppendLine();
         }
@@ -326,7 +333,7 @@ internal static partial class Program
             {
                 builder.AppendLine($"PID:     {app.ProcessId}");
                 builder.AppendLine($"Started: {app.StartedAt.LocalDateTime:yyyy-MM-dd HH:mm:ss}");
-                builder.AppendLine($"Command: {FormatCommand(app.Request.Executable, app.Request.Arguments)}");
+                builder.AppendLine($"Command: {FormatRequest(app.Request)}");
                 builder.AppendLine($"Desktop: {(app.DesktopId is null ? "unknown" : app.DesktopId)}");
                 builder.AppendLine();
             }
@@ -492,19 +499,9 @@ internal static partial class Program
         {
             try
             {
-                var startInfo = new ProcessStartInfo
-                {
-                    FileName = request.Executable,
-                    UseShellExecute = true,
-                    WorkingDirectory = GetWorkingDirectory(request.Executable),
-                };
-
-                foreach (var arg in request.Arguments)
-                {
-                    startInfo.ArgumentList.Add(arg);
-                }
-
-                var process = Process.Start(startInfo) ?? throw new InvalidOperationException("The child process could not be started.");
+                var process = request.Kind == LaunchKind.DefaultOpen
+                    ? StartDefaultOpen(request.Executable)
+                    : StartExecutable(request);
                 process.EnableRaisingEvents = true;
 
                 var app = new MonitoredApp(request, process, DateTimeOffset.Now, null);
@@ -577,6 +574,49 @@ internal static partial class Program
             var fullPath = Path.GetFullPath(executable);
             var directory = Path.GetDirectoryName(fullPath);
             return string.IsNullOrWhiteSpace(directory) ? Environment.CurrentDirectory : directory;
+        }
+
+        private static Process StartExecutable(LaunchRequest request)
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = request.Executable,
+                UseShellExecute = true,
+                WorkingDirectory = GetWorkingDirectory(request.Executable),
+            };
+
+            foreach (var arg in request.Arguments)
+            {
+                startInfo.ArgumentList.Add(arg);
+            }
+
+            return Process.Start(startInfo) ?? throw new InvalidOperationException("The child process could not be started.");
+        }
+
+        private static Process StartDefaultOpen(string target)
+        {
+            if (Directory.Exists(target))
+            {
+                var startInfo = new ProcessStartInfo
+                {
+                    FileName = "explorer.exe",
+                    UseShellExecute = false,
+                };
+                startInfo.ArgumentList.Add(target);
+                return Process.Start(startInfo) ?? throw new InvalidOperationException("Explorer could not be started.");
+            }
+
+            var shellStartInfo = new ProcessStartInfo
+            {
+                FileName = target,
+                Verb = "open",
+                UseShellExecute = true,
+                WorkingDirectory = File.Exists(target)
+                    ? Path.GetDirectoryName(Path.GetFullPath(target)) ?? Environment.CurrentDirectory
+                    : Environment.CurrentDirectory,
+            };
+
+            return Process.Start(shellStartInfo) ?? throw new InvalidOperationException("The default shell action did not return a process to monitor.");
         }
 
         private void Remove(MonitoredApp app)
@@ -688,7 +728,7 @@ internal static partial class Program
             {
                 var item = new ListViewItem(app.Process.Id.ToString());
                 item.SubItems.Add(app.StartedAt.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss"));
-                item.SubItems.Add(FormatCommand(app.Request.Executable, app.Request.Arguments));
+                item.SubItems.Add(FormatRequest(app.Request));
                 item.SubItems.Add(app.DesktopId?.ToString() ?? "unknown");
                 listView.Items.Add(item);
             }
@@ -722,12 +762,20 @@ internal static partial class Program
             }
 
             var executableIndex = 0;
+            var launchKind = LaunchKind.DefaultOpen;
             while (executableIndex < args.Length)
             {
                 if (args[executableIndex] == "--")
                 {
                     executableIndex++;
                     break;
+                }
+
+                if (Is(args[executableIndex], "--exec"))
+                {
+                    launchKind = LaunchKind.Executable;
+                    executableIndex++;
+                    continue;
                 }
 
                 if (!args[executableIndex].StartsWith('-'))
@@ -743,7 +791,10 @@ internal static partial class Program
                 return new AppCommand(null, false, CommandMode.ShowGui);
             }
 
-            var request = new LaunchRequest(args[executableIndex], args.Skip(executableIndex + 1).ToArray(), null);
+            var request = launchKind == LaunchKind.Executable
+                ? new LaunchRequest(args[executableIndex], args.Skip(executableIndex + 1).ToArray(), null, LaunchKind.Executable)
+                : new LaunchRequest(args[executableIndex], [], null, LaunchKind.DefaultOpen);
+
             return new AppCommand(request, false, CommandMode.Launch);
         }
 
@@ -760,7 +811,13 @@ internal static partial class Program
         List,
     }
 
-    private sealed record LaunchRequest(string Executable, string[] Arguments, Guid? DesktopId);
+    private enum LaunchKind
+    {
+        Executable,
+        DefaultOpen,
+    }
+
+    private sealed record LaunchRequest(string Executable, string[] Arguments, Guid? DesktopId, LaunchKind Kind);
 
     private sealed record SavedSession(LaunchRequest[] Apps);
 
