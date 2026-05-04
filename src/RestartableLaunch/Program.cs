@@ -2311,6 +2311,7 @@ internal static partial class Program
         {
             var menu = new ContextMenuStrip();
             var monitorAllItem = new ToolStripMenuItem();
+            var separator = new ToolStripSeparator();
             menu.Opening += (_, e) =>
             {
                 e.Cancel = listView.SelectedItems.Count == 0;
@@ -2321,6 +2322,7 @@ internal static partial class Program
 
                 var selectedApp = GetSelectedMonitoredApp();
                 monitorAllItem.Visible = selectedApp is not null && selectedApp.RuleId is null;
+                separator.Visible = monitorAllItem.Visible;
                 monitorAllItem.Text = selectedApp is null
                     ? "Monitor all instances"
                     : $"Monitor all instances of {selectedApp.Process.ProcessName}.exe";
@@ -2333,7 +2335,7 @@ internal static partial class Program
                 }
             };
             menu.Items.Add(monitorAllItem);
-            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(separator);
             menu.Items.Add("Remove", null, (_, _) => RemoveSelectedApps());
             return menu;
         }
