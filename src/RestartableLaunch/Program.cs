@@ -17,6 +17,12 @@ internal static partial class Program
     private const int WindowWaitTimeoutMilliseconds = 30000;
     private const int WindowWaitPollMilliseconds = 250;
     private const string StartupRunName = "RestartableLaunch";
+    private const int WmGetIcon = 0x007F;
+    private const int IconSmall = 0;
+    private const int IconBig = 1;
+    private const int IconSmall2 = 2;
+    private const int GclpHIcon = -14;
+    private const int GclpHIconSmall = -34;
 
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private static readonly JsonSerializerOptions PipeJsonOptions = new();
@@ -337,6 +343,63 @@ internal static partial class Program
         return builder.ToString();
     }
 
+    private static Icon TryGetWindowIcon(IntPtr window, int processId)
+    {
+        var iconHandle = SendMessage(window, WmGetIcon, (IntPtr)IconSmall2, IntPtr.Zero);
+        if (iconHandle == IntPtr.Zero)
+        {
+            iconHandle = SendMessage(window, WmGetIcon, (IntPtr)IconSmall, IntPtr.Zero);
+        }
+
+        if (iconHandle == IntPtr.Zero)
+        {
+            iconHandle = SendMessage(window, WmGetIcon, (IntPtr)IconBig, IntPtr.Zero);
+        }
+
+        if (iconHandle == IntPtr.Zero)
+        {
+            iconHandle = GetClassLongPtr(window, GclpHIconSmall);
+        }
+
+        if (iconHandle == IntPtr.Zero)
+        {
+            iconHandle = GetClassLongPtr(window, GclpHIcon);
+        }
+
+        if (iconHandle != IntPtr.Zero)
+        {
+            try
+            {
+                using var icon = Icon.FromHandle(iconHandle);
+                return (Icon)icon.Clone();
+            }
+            catch
+            {
+                // Fall back to the executable icon below.
+            }
+        }
+
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            var fileName = process.MainModule?.FileName;
+            if (!string.IsNullOrWhiteSpace(fileName))
+            {
+                var icon = Icon.ExtractAssociatedIcon(fileName);
+                if (icon is not null)
+                {
+                    return icon;
+                }
+            }
+        }
+        catch
+        {
+            // Fall back to the app icon when process details are unavailable.
+        }
+
+        return CloneAppIcon();
+    }
+
     private static WindowBounds? TryGetWindowBounds(IntPtr window)
     {
         if (window == IntPtr.Zero || !GetWindowRect(window, out var rect))
@@ -638,6 +701,12 @@ internal static partial class Program
     [LibraryImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool MoveWindow(IntPtr hWnd, int x, int y, int nWidth, int nHeight, [MarshalAs(UnmanagedType.Bool)] bool repaint);
+
+    [LibraryImport("user32.dll", EntryPoint = "SendMessageW")]
+    private static partial IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", EntryPoint = "GetClassLongPtrW", SetLastError = true)]
+    private static extern IntPtr GetClassLongPtr(IntPtr hWnd, int nIndex);
 
     [LibraryImport("shell32.dll", EntryPoint = "CommandLineToArgvW", StringMarshalling = StringMarshalling.Utf16)]
     private static partial IntPtr CommandLineToArgvW(string lpCmdLine, out int pNumArgs);
@@ -1275,6 +1344,7 @@ internal static partial class Program
     private sealed class WindowPickerForm : Form
     {
         private readonly ListView listView = new();
+        private readonly ImageList windowIcons = new();
         private readonly Button okButton = new();
         private readonly Button cancelButton = new();
         private readonly List<WindowCandidate> candidates;
@@ -1283,26 +1353,41 @@ internal static partial class Program
         {
             Text = "Add Open Window";
             Icon = CloneAppIcon();
-            Width = 760;
+            Width = 820;
             Height = 420;
             StartPosition = FormStartPosition.CenterParent;
             MinimizeBox = false;
             MaximizeBox = false;
 
             candidates = GetOpenWindowCandidates();
+            windowIcons.ColorDepth = ColorDepth.Depth32Bit;
+            windowIcons.ImageSize = new Size(16, 16);
 
             listView.Dock = DockStyle.Fill;
             listView.View = View.Details;
             listView.FullRowSelect = true;
             listView.GridLines = true;
+            listView.SmallImageList = windowIcons;
+            listView.Columns.Add(string.Empty, 34);
             listView.Columns.Add("Process", 160);
             listView.Columns.Add("PID", 80);
-            listView.Columns.Add("Window title", 480);
+            listView.Columns.Add("Window title", 450);
             listView.DoubleClick += (_, _) => AcceptSelection();
 
             foreach (var candidate in candidates)
             {
-                var item = new ListViewItem(candidate.ProcessName);
+                var imageKey = $"window-{candidate.Handle.ToInt64()}";
+                using (var icon = TryGetWindowIcon(candidate.Handle, candidate.ProcessId))
+                {
+                    windowIcons.Images.Add(imageKey, icon);
+                }
+
+                var item = new ListViewItem(string.Empty)
+                {
+                    ImageKey = imageKey,
+                };
+
+                item.SubItems.Add(candidate.ProcessName);
                 item.SubItems.Add(candidate.ProcessId.ToString());
                 item.SubItems.Add(candidate.Title);
                 item.Tag = candidate;
