@@ -6,12 +6,11 @@
     </linearGradient>
   </defs>
   <rect x="18" y="18" width="220" height="220" rx="52" fill="url(#bg)"/>
-  <rect x="58" y="84" width="140" height="102" rx="18" fill="#F8FCFF"/>
-  <rect x="58" y="84" width="140" height="30" rx="18" fill="#11324A"/>
-  <rect x="76" y="132" width="82" height="16" rx="8" fill="#11324A"/>
-  <path d="M154 121l34 27-34 27" fill="none" stroke="#11324A" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M66 96c18-35 56-55 97-47 30 6 54 26 67 52" fill="none" stroke="#FFFFFF" stroke-width="22" stroke-linecap="round"/>
-  <path d="M215 66l14 53-54-9z" fill="#FFFFFF"/>
-  <path d="M190 182c-21 25-56 36-90 25-32-10-55-36-63-67" fill="none" stroke="#FFFFFF" stroke-width="22" stroke-linecap="round"/>
-  <path d="M43 190l-15-53 55 8z" fill="#FFFFFF"/>
+  <rect x="48" y="62" width="160" height="132" rx="22" fill="#F8FCFF"/>
+  <path d="M70 62h116a22 22 0 0 1 22 22v28H48V84a22 22 0 0 1 22-22z" fill="#11324A"/>
+  <circle cx="74" cy="88" r="7" fill="#6EE7B7"/>
+  <circle cx="98" cy="88" r="7" fill="#FDE68A"/>
+  <circle cx="122" cy="88" r="7" fill="#FDA4AF"/>
+  <path d="M82 147h68" stroke="#11324A" stroke-width="20" stroke-linecap="round"/>
+  <path d="M137 124l44 36-44 36" fill="none" stroke="#11324A" stroke-width="22" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>
