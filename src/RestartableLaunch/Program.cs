@@ -270,7 +270,11 @@ internal static partial class Program
         return IntPtr.Zero;
     }
 
-    private static async Task<IntPtr> WaitForLaunchWindowAsync(MonitoredApp app, HashSet<IntPtr> existingWindows, CancellationToken cancellationToken)
+    private static async Task<IntPtr> WaitForLaunchWindowAsync(
+        MonitoredApp app,
+        HashSet<IntPtr> existingWindows,
+        Func<int, bool> isAlreadyMonitoredProcess,
+        CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
         {
@@ -280,7 +284,7 @@ internal static partial class Program
                 return directWindow;
             }
 
-            var replacementWindow = FindReplacementLaunchWindow(app, existingWindows);
+            var replacementWindow = FindReplacementLaunchWindow(app, existingWindows, isAlreadyMonitoredProcess);
             if (replacementWindow != IntPtr.Zero)
             {
                 return replacementWindow;
@@ -297,7 +301,7 @@ internal static partial class Program
         return IntPtr.Zero;
     }
 
-    private static IntPtr FindReplacementLaunchWindow(MonitoredApp app, HashSet<IntPtr> existingWindows)
+    private static IntPtr FindReplacementLaunchWindow(MonitoredApp app, HashSet<IntPtr> existingWindows, Func<int, bool> isAlreadyMonitoredProcess)
     {
         var result = IntPtr.Zero;
         var requestedProcessName = Path.GetFileNameWithoutExtension(app.Request.Executable);
@@ -316,7 +320,7 @@ internal static partial class Program
             }
 
             GetWindowThreadProcessId(window, out var processId);
-            if (processId == Environment.ProcessId)
+            if (processId == Environment.ProcessId || isAlreadyMonitoredProcess(processId))
             {
                 return true;
             }
@@ -1316,6 +1320,11 @@ internal static partial class Program
                 || string.Equals(process.ProcessName, expectedProcessName, StringComparison.OrdinalIgnoreCase);
         }
 
+        private bool IsAlreadyMonitoredProcess(int processId)
+        {
+            return apps.Any(app => !app.Process.HasExited && app.Process.Id == processId);
+        }
+
         private void SaveSession()
         {
             if (IsExiting && !sessionEnding)
@@ -1374,7 +1383,7 @@ internal static partial class Program
             try
             {
                 using var cancellation = new CancellationTokenSource(WindowWaitTimeoutMilliseconds + 5000);
-                var window = await WaitForLaunchWindowAsync(app, existingWindows, cancellation.Token);
+                var window = await WaitForLaunchWindowAsync(app, existingWindows, IsAlreadyMonitoredProcess, cancellation.Token);
                 if (window == IntPtr.Zero)
                 {
                     Post(() =>
