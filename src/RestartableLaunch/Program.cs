@@ -256,6 +256,15 @@ internal static partial class Program
         imageList.Images.Add(key, bitmap);
     }
 
+    private static ImageList CreateSmallIconList()
+    {
+        return new ImageList
+        {
+            ColorDepth = ColorDepth.Depth32Bit,
+            ImageSize = new Size(16, 16),
+        };
+    }
+
     private static Icon TryGetProcessIcon(Process process)
     {
         var processName = TryGetProcessName(process);
@@ -1844,8 +1853,8 @@ internal static partial class Program
         private readonly ManagerContext context;
         private readonly ListView listView = new();
         private readonly ListView rulesView = new();
-        private readonly ImageList appIcons = new();
-        private readonly ImageList ruleIcons = new();
+        private ImageList appIcons = CreateSmallIconList();
+        private ImageList ruleIcons = CreateSmallIconList();
         private readonly Button addWindowButton = new();
         private readonly Button removeButton = new();
         private readonly CheckBox startupCheckBox = new();
@@ -1907,11 +1916,6 @@ internal static partial class Program
                 removeButton.Location = new Point(addWindowButton.Left - removeButton.Width - 10, 26);
             };
             removeButton.Location = new Point(addWindowButton.Left - removeButton.Width - 10, 26);
-
-            appIcons.ColorDepth = ColorDepth.Depth32Bit;
-            appIcons.ImageSize = new Size(16, 16);
-            ruleIcons.ColorDepth = ColorDepth.Depth32Bit;
-            ruleIcons.ImageSize = new Size(16, 16);
 
             listView.Dock = DockStyle.Fill;
             listView.BorderStyle = BorderStyle.None;
@@ -2000,24 +2004,21 @@ internal static partial class Program
 
         public void RefreshApps()
         {
-            listView.BeginUpdate();
-            listView.Items.Clear();
-            appIcons.Images.Clear();
-            rulesView.BeginUpdate();
-            rulesView.Items.Clear();
-            ruleIcons.Images.Clear();
+            var nextAppIcons = CreateSmallIconList();
+            var appItems = new List<ListViewItem>();
 
             foreach (var app in context.Apps)
             {
                 var imageKey = $"app-{app.Process.Id}";
+                var imageIndex = nextAppIcons.Images.Count;
                 using (var icon = TryGetProcessIcon(app.Process))
                 {
-                    AddIconImage(appIcons, imageKey, icon);
+                    AddIconImage(nextAppIcons, imageKey, icon);
                 }
 
                 var item = new ListViewItem(string.Empty)
                 {
-                    ImageKey = imageKey,
+                    ImageIndex = imageIndex,
                 };
                 item.SubItems.Add(app.Process.ProcessName);
                 item.SubItems.Add(app.Process.Id.ToString());
@@ -2026,29 +2027,56 @@ internal static partial class Program
                 item.SubItems.Add(FormatRequest(app.Request));
                 item.SubItems.Add(app.DesktopId?.ToString() ?? "unknown");
                 item.Tag = app;
-                listView.Items.Add(item);
+                appItems.Add(item);
             }
 
+            var nextRuleIcons = CreateSmallIconList();
+            var ruleItems = new List<ListViewItem>();
             foreach (var rule in context.MonitorRules)
             {
                 var imageKey = $"rule-{rule.Id}";
+                var imageIndex = nextRuleIcons.Images.Count;
                 using (var icon = TryGetRuleIcon(rule))
                 {
-                    AddIconImage(ruleIcons, imageKey, icon);
+                    AddIconImage(nextRuleIcons, imageKey, icon);
                 }
 
                 var item = new ListViewItem(string.Empty)
                 {
-                    ImageKey = imageKey,
+                    ImageIndex = imageIndex,
                 };
                 item.SubItems.Add(rule.ProcessName);
                 item.SubItems.Add(string.IsNullOrWhiteSpace(rule.ExecutablePath) ? "(process name only)" : rule.ExecutablePath);
                 item.Tag = rule;
-                rulesView.Items.Add(item);
+                ruleItems.Add(item);
             }
 
-            listView.EndUpdate();
-            rulesView.EndUpdate();
+            var oldAppIcons = appIcons;
+            var oldRuleIcons = ruleIcons;
+            appIcons = nextAppIcons;
+            ruleIcons = nextRuleIcons;
+
+            listView.BeginUpdate();
+            rulesView.BeginUpdate();
+            try
+            {
+                listView.SmallImageList = null;
+                rulesView.SmallImageList = null;
+                listView.Items.Clear();
+                rulesView.Items.Clear();
+                listView.SmallImageList = appIcons;
+                rulesView.SmallImageList = ruleIcons;
+                listView.Items.AddRange(appItems.ToArray());
+                rulesView.Items.AddRange(ruleItems.ToArray());
+            }
+            finally
+            {
+                listView.EndUpdate();
+                rulesView.EndUpdate();
+                oldAppIcons.Dispose();
+                oldRuleIcons.Dispose();
+            }
+
             UpdateRemoveButtonState();
             statusLabel.Text = context.Apps.Count == 1
                 ? $"1 monitored app, {context.MonitorRules.Count} watch rules"
