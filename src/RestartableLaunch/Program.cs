@@ -14,8 +14,11 @@ internal static partial class Program
     private const string MutexName = @"Local\RestartableLaunch.Manager";
     private const string PipeName = "RestartableLaunch.Manager";
     private const int SwHide = 0;
+    private const int WindowWaitTimeoutMilliseconds = 30000;
+    private const int WindowWaitPollMilliseconds = 250;
 
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+    private static readonly JsonSerializerOptions PipeJsonOptions = new();
 
     [STAThread]
     private static int Main(string[] args)
@@ -23,22 +26,17 @@ internal static partial class Program
         ApplicationConfiguration.Initialize();
 
         var command = AppCommand.Parse(args);
+        if (command.Mode == CommandMode.List)
+        {
+            Console.WriteLine(ReadActiveStateList());
+            return 0;
+        }
+
         using var mutex = new Mutex(false, MutexName, out var isFirstInstance);
 
         if (!isFirstInstance)
         {
             var response = SendToExistingInstance(command);
-            if (command.Mode == CommandMode.List)
-            {
-                Console.WriteLine(response.Length == 0 ? "RestartableLaunch is running, but no response was returned." : response);
-            }
-
-            return 0;
-        }
-
-        if (command.Mode == CommandMode.List)
-        {
-            Console.WriteLine("No applications are currently monitored by RestartableLaunch.");
             return 0;
         }
 
@@ -75,14 +73,14 @@ internal static partial class Program
             {
                 await using var pipe = new NamedPipeServerStream(PipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
                 await pipe.WaitForConnectionAsync();
-                using var reader = new StreamReader(pipe, Encoding.UTF8);
+                using var reader = new StreamReader(pipe, Encoding.UTF8, leaveOpen: true);
                 var json = await reader.ReadLineAsync();
                 if (string.IsNullOrWhiteSpace(json))
                 {
                     continue;
                 }
 
-                var command = JsonSerializer.Deserialize<AppCommand>(json, JsonOptions);
+                var command = JsonSerializer.Deserialize<AppCommand>(json, PipeJsonOptions);
                 if (command is null)
                 {
                     continue;
@@ -90,7 +88,7 @@ internal static partial class Program
 
                 if (command.Mode == CommandMode.List)
                 {
-                    using var writer = new StreamWriter(pipe, Encoding.UTF8) { AutoFlush = true };
+                    using var writer = new StreamWriter(pipe, Encoding.UTF8, leaveOpen: true) { AutoFlush = true };
                     writer.Write(FormatApps(context.Apps));
                     continue;
                 }
@@ -121,16 +119,15 @@ internal static partial class Program
         {
             using var pipe = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut);
             pipe.Connect(1500);
-            using var writer = new StreamWriter(pipe, Encoding.UTF8) { AutoFlush = true };
-            writer.WriteLine(JsonSerializer.Serialize(command, JsonOptions));
-            pipe.WaitForPipeDrain();
+            using var writer = new StreamWriter(pipe, Encoding.UTF8, leaveOpen: true) { AutoFlush = true };
+            writer.WriteLine(JsonSerializer.Serialize(command, PipeJsonOptions));
 
             if (command.Mode != CommandMode.List)
             {
                 return string.Empty;
             }
 
-            using var reader = new StreamReader(pipe, Encoding.UTF8);
+            using var reader = new StreamReader(pipe, Encoding.UTF8, leaveOpen: true);
             return reader.ReadToEnd();
         }
         catch (Exception ex)
@@ -203,6 +200,7 @@ internal static partial class Program
             builder.AppendLine($"PID:     {app.Process.Id}");
             builder.AppendLine($"Started: {app.StartedAt.LocalDateTime:yyyy-MM-dd HH:mm:ss}");
             builder.AppendLine($"Command: {FormatCommand(app.Request.Executable, app.Request.Arguments)}");
+            builder.AppendLine($"Desktop: {(app.DesktopId is null ? "unknown" : app.DesktopId)}");
             builder.AppendLine();
         }
 
@@ -218,6 +216,49 @@ internal static partial class Program
         }
     }
 
+    private static async Task<IntPtr> WaitForMainWindowAsync(Process process, CancellationToken cancellationToken)
+    {
+        var deadline = DateTimeOffset.UtcNow.AddMilliseconds(WindowWaitTimeoutMilliseconds);
+
+        while (!process.HasExited && DateTimeOffset.UtcNow < deadline)
+        {
+            process.Refresh();
+            if (process.MainWindowHandle != IntPtr.Zero)
+            {
+                return process.MainWindowHandle;
+            }
+
+            var window = FindTopLevelWindow(process.Id);
+            if (window != IntPtr.Zero)
+            {
+                return window;
+            }
+
+            await Task.Delay(WindowWaitPollMilliseconds, cancellationToken);
+        }
+
+        return IntPtr.Zero;
+    }
+
+    private static IntPtr FindTopLevelWindow(int processId)
+    {
+        var result = IntPtr.Zero;
+
+        EnumWindows((window, _) =>
+        {
+            GetWindowThreadProcessId(window, out var windowProcessId);
+            if (windowProcessId == processId && IsWindowVisible(window))
+            {
+                result = window;
+                return false;
+            }
+
+            return true;
+        }, IntPtr.Zero);
+
+        return result;
+    }
+
     private static string AppDataDirectory
     {
         get
@@ -231,6 +272,64 @@ internal static partial class Program
     }
 
     private static string SessionPath => Path.Combine(AppDataDirectory, "session.json");
+
+    private static string ActiveStatePath => Path.Combine(AppDataDirectory, "active.json");
+
+    private static string ReadActiveStateList()
+    {
+        if (!File.Exists(ActiveStatePath))
+        {
+            return "No applications are currently monitored by RestartableLaunch.";
+        }
+
+        try
+        {
+            var state = JsonSerializer.Deserialize<ActiveState>(File.ReadAllText(ActiveStatePath), JsonOptions);
+            if (state is null || state.Apps.Length == 0)
+            {
+                return "No applications are currently monitored by RestartableLaunch.";
+            }
+
+            var liveApps = state.Apps.Where(static app => IsProcessAlive(app.ProcessId)).ToArray();
+            if (liveApps.Length == 0)
+            {
+                TryDelete(ActiveStatePath);
+                return "No applications are currently monitored by RestartableLaunch.";
+            }
+
+            var builder = new StringBuilder();
+            builder.AppendLine("Applications monitored by RestartableLaunch:");
+            builder.AppendLine();
+
+            foreach (var app in liveApps)
+            {
+                builder.AppendLine($"PID:     {app.ProcessId}");
+                builder.AppendLine($"Started: {app.StartedAt.LocalDateTime:yyyy-MM-dd HH:mm:ss}");
+                builder.AppendLine($"Command: {FormatCommand(app.Request.Executable, app.Request.Arguments)}");
+                builder.AppendLine($"Desktop: {(app.DesktopId is null ? "unknown" : app.DesktopId)}");
+                builder.AppendLine();
+            }
+
+            return builder.ToString().TrimEnd();
+        }
+        catch
+        {
+            return "No applications are currently monitored by RestartableLaunch.";
+        }
+    }
+
+    private static bool IsProcessAlive(int processId)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            return !process.HasExited;
+        }
+        catch
+        {
+            return false;
+        }
+    }
 
     private static void TryDelete(string path)
     {
@@ -259,6 +358,78 @@ internal static partial class Program
     [LibraryImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool IsWindowVisible(IntPtr hWnd);
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [LibraryImport("user32.dll")]
+    private static partial uint GetWindowThreadProcessId(IntPtr hWnd, out int processId);
+
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [ComImport]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    [Guid("A5CD92FF-29BE-454C-8D04-D82879FB3F1B")]
+    private interface IVirtualDesktopManager
+    {
+        int IsWindowOnCurrentVirtualDesktop(IntPtr topLevelWindow, out bool onCurrentDesktop);
+
+        int GetWindowDesktopId(IntPtr topLevelWindow, out Guid desktopId);
+
+        int MoveWindowToDesktop(IntPtr topLevelWindow, ref Guid desktopId);
+    }
+
+    private static class VirtualDesktopPlacement
+    {
+        private static IVirtualDesktopManager CreateManager()
+        {
+            var type = Type.GetTypeFromCLSID(new Guid("AA509086-5CA9-4C25-8F95-589D3C07B48A"), throwOnError: true);
+            return (IVirtualDesktopManager)Activator.CreateInstance(type!)!;
+        }
+
+        public static Guid? TryGetDesktopId(IntPtr window)
+        {
+            if (window == IntPtr.Zero)
+            {
+                return null;
+            }
+
+            try
+            {
+                var manager = CreateManager();
+                var result = manager.GetWindowDesktopId(window, out var desktopId);
+                return result == 0 && desktopId != Guid.Empty ? desktopId : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        public static bool TryMoveToDesktop(IntPtr window, Guid desktopId)
+        {
+            if (window == IntPtr.Zero || desktopId == Guid.Empty)
+            {
+                return false;
+            }
+
+            try
+            {
+                var manager = CreateManager();
+                var target = desktopId;
+                return manager.MoveWindowToDesktop(window, ref target) == 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }
 
     private sealed class ManagerContext : ApplicationContext
     {
@@ -315,12 +486,13 @@ internal static partial class Program
                 var process = Process.Start(startInfo) ?? throw new InvalidOperationException("The child process could not be started.");
                 process.EnableRaisingEvents = true;
 
-                var app = new MonitoredApp(request, process, DateTimeOffset.Now);
+                var app = new MonitoredApp(request, process, DateTimeOffset.Now, null);
                 apps.Add(app);
                 process.Exited += (_, _) => Post(() => Remove(app));
 
                 SaveSession();
                 mainForm.RefreshApps();
+                _ = TrackWindowPlacementAsync(app, request.DesktopId);
             }
             catch (Exception ex)
             {
@@ -373,6 +545,7 @@ internal static partial class Program
             if (!sessionEnding)
             {
                 TryDelete(SessionPath);
+                TryDelete(ActiveStatePath);
             }
 
             base.ExitThreadCore();
@@ -395,8 +568,56 @@ internal static partial class Program
 
         private void SaveSession()
         {
-            var session = new SavedSession(apps.Select(static app => app.Request).ToArray());
+            var session = new SavedSession(apps.Select(static app => app.Request with { DesktopId = app.DesktopId }).ToArray());
             File.WriteAllText(SessionPath, JsonSerializer.Serialize(session, JsonOptions));
+            SaveActiveState();
+        }
+
+        private void SaveActiveState()
+        {
+            var state = new ActiveState(apps.Select(static app => new ActiveAppState(
+                app.Process.Id,
+                app.StartedAt,
+                app.Request with { DesktopId = app.DesktopId },
+                app.DesktopId)).ToArray());
+
+            File.WriteAllText(ActiveStatePath, JsonSerializer.Serialize(state, JsonOptions));
+        }
+
+        private async Task TrackWindowPlacementAsync(MonitoredApp app, Guid? restoreDesktopId)
+        {
+            try
+            {
+                using var cancellation = new CancellationTokenSource(WindowWaitTimeoutMilliseconds + 5000);
+                var window = await WaitForMainWindowAsync(app.Process, cancellation.Token);
+                if (window == IntPtr.Zero)
+                {
+                    return;
+                }
+
+                if (restoreDesktopId is { } targetDesktopId)
+                {
+                    VirtualDesktopPlacement.TryMoveToDesktop(window, targetDesktopId);
+                }
+
+                await Task.Delay(500, cancellation.Token);
+                var currentDesktopId = VirtualDesktopPlacement.TryGetDesktopId(window) ?? restoreDesktopId;
+                if (currentDesktopId is null)
+                {
+                    return;
+                }
+
+                Post(() =>
+                {
+                    app.DesktopId = currentDesktopId;
+                    SaveSession();
+                    mainForm.RefreshApps();
+                });
+            }
+            catch
+            {
+                // Virtual desktop placement uses Windows shell APIs that can fail across builds.
+            }
         }
 
         private void OnSessionEnding(object sender, SessionEndingEventArgs e)
@@ -425,7 +646,8 @@ internal static partial class Program
             listView.GridLines = true;
             listView.Columns.Add("PID", 80);
             listView.Columns.Add("Started", 150);
-            listView.Columns.Add("Command line", 620);
+            listView.Columns.Add("Command line", 520);
+            listView.Columns.Add("Desktop", 240);
             Controls.Add(listView);
 
             FormClosing += (_, e) =>
@@ -445,6 +667,7 @@ internal static partial class Program
                 var item = new ListViewItem(app.Process.Id.ToString());
                 item.SubItems.Add(app.StartedAt.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss"));
                 item.SubItems.Add(FormatCommand(app.Request.Executable, app.Request.Arguments));
+                item.SubItems.Add(app.DesktopId?.ToString() ?? "unknown");
                 listView.Items.Add(item);
             }
 
@@ -498,7 +721,7 @@ internal static partial class Program
                 return new AppCommand(null, false, CommandMode.ShowGui);
             }
 
-            var request = new LaunchRequest(args[executableIndex], args.Skip(executableIndex + 1).ToArray());
+            var request = new LaunchRequest(args[executableIndex], args.Skip(executableIndex + 1).ToArray(), null);
             return new AppCommand(request, false, CommandMode.Launch);
         }
 
@@ -515,9 +738,16 @@ internal static partial class Program
         List,
     }
 
-    private sealed record LaunchRequest(string Executable, string[] Arguments);
+    private sealed record LaunchRequest(string Executable, string[] Arguments, Guid? DesktopId);
 
     private sealed record SavedSession(LaunchRequest[] Apps);
 
-    private sealed record MonitoredApp(LaunchRequest Request, Process Process, DateTimeOffset StartedAt);
+    private sealed record ActiveState(ActiveAppState[] Apps);
+
+    private sealed record ActiveAppState(int ProcessId, DateTimeOffset StartedAt, LaunchRequest Request, Guid? DesktopId);
+
+    private sealed record MonitoredApp(LaunchRequest Request, Process Process, DateTimeOffset StartedAt, Guid? DesktopId)
+    {
+        public Guid? DesktopId { get; set; } = DesktopId;
+    }
 }

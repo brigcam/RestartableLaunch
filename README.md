@@ -41,12 +41,20 @@ RestartableLaunch.exe --list
 The GUI window also lists the currently monitored applications and their command
 lines.
 
+## Virtual desktops
+
+RestartableLaunch always tries to remember the virtual desktop of each monitored
+window and move it back there during restore. This uses Windows shell COM
+virtual desktop APIs directly. If Windows refuses a move, the application still
+launches normally.
+
 ## Notes
 
 - The tray manager must remain running for Windows to restart it.
 - If a wrapped application is closed manually, it is removed from the monitored list.
 - Unsaved application state is still the responsibility of the wrapped app.
-- Virtual desktop placement is not restored.
+- Virtual desktop placement is best effort because Windows may reject desktop
+  moves after system updates or when the saved desktop no longer exists.
 
 ## Build
 
