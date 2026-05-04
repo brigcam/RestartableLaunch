@@ -46,6 +46,8 @@ current user.
 Use **Add open window...** to choose a currently open window and make it
 restartable. RestartableLaunch reads the owning process command line, remembers
 the window position and virtual desktop when available, and starts monitoring it.
+Select one or more monitored entries and use **Remove**, the context menu, or
+the Delete key to remove entries that were added by mistake.
 
 ## Explorer context menu
 

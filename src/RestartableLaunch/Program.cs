@@ -817,6 +817,25 @@ internal static partial class Program
             }
         }
 
+        public void RemoveApps(IEnumerable<MonitoredApp> selectedApps)
+        {
+            var removed = false;
+            foreach (var app in selectedApps.ToArray())
+            {
+                if (apps.Remove(app))
+                {
+                    app.Process.Dispose();
+                    removed = true;
+                }
+            }
+
+            if (removed)
+            {
+                SaveSession();
+                mainForm.RefreshApps();
+            }
+        }
+
         public void RestoreSavedSession()
         {
             if (!File.Exists(SessionPath))
@@ -996,6 +1015,7 @@ internal static partial class Program
         private readonly ManagerContext context;
         private readonly ListView listView = new();
         private readonly Button addWindowButton = new();
+        private readonly Button removeButton = new();
         private readonly CheckBox startupCheckBox = new();
         private readonly CheckBox explorerMenuCheckBox = new();
         private bool updatingStartupCheckBox;
@@ -1035,19 +1055,39 @@ internal static partial class Program
             addWindowButton.Location = new Point(topPanel.Width - addWindowButton.Width - 12, 17);
             addWindowButton.Click += (_, _) => AddOpenWindow();
             topPanel.Controls.Add(addWindowButton);
+
+            removeButton.Text = "Remove";
+            removeButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            removeButton.Size = new Size(90, 28);
+            removeButton.Enabled = false;
+            removeButton.Click += (_, _) => RemoveSelectedApps();
+            topPanel.Controls.Add(removeButton);
             topPanel.Resize += (_, _) =>
             {
                 addWindowButton.Location = new Point(topPanel.ClientSize.Width - addWindowButton.Width - 12, 17);
+                removeButton.Location = new Point(addWindowButton.Left - removeButton.Width - 8, 17);
             };
+            removeButton.Location = new Point(addWindowButton.Left - removeButton.Width - 8, 17);
 
             listView.Dock = DockStyle.Fill;
             listView.View = View.Details;
             listView.FullRowSelect = true;
             listView.GridLines = true;
+            listView.MultiSelect = true;
             listView.Columns.Add("PID", 80);
             listView.Columns.Add("Started", 150);
             listView.Columns.Add("Command line", 520);
             listView.Columns.Add("Desktop", 240);
+            listView.SelectedIndexChanged += (_, _) => UpdateRemoveButtonState();
+            listView.KeyDown += (_, e) =>
+            {
+                if (e.KeyCode == Keys.Delete)
+                {
+                    RemoveSelectedApps();
+                    e.Handled = true;
+                }
+            };
+            listView.ContextMenuStrip = BuildListContextMenu();
             Controls.Add(listView);
             Controls.Add(topPanel);
 
@@ -1072,10 +1112,44 @@ internal static partial class Program
                 item.SubItems.Add(app.StartedAt.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss"));
                 item.SubItems.Add(FormatRequest(app.Request));
                 item.SubItems.Add(app.DesktopId?.ToString() ?? "unknown");
+                item.Tag = app;
                 listView.Items.Add(item);
             }
 
             listView.EndUpdate();
+            UpdateRemoveButtonState();
+        }
+
+        private ContextMenuStrip BuildListContextMenu()
+        {
+            var menu = new ContextMenuStrip();
+            menu.Opening += (_, e) =>
+            {
+                e.Cancel = listView.SelectedItems.Count == 0;
+            };
+            menu.Items.Add("Remove", null, (_, _) => RemoveSelectedApps());
+            return menu;
+        }
+
+        private void UpdateRemoveButtonState()
+        {
+            removeButton.Enabled = listView.SelectedItems.Count > 0;
+        }
+
+        private void RemoveSelectedApps()
+        {
+            var selectedApps = listView.SelectedItems
+                .Cast<ListViewItem>()
+                .Select(static item => item.Tag)
+                .OfType<MonitoredApp>()
+                .ToArray();
+
+            if (selectedApps.Length == 0)
+            {
+                return;
+            }
+
+            context.RemoveApps(selectedApps);
         }
 
         private void RefreshExplorerContextMenuState()
