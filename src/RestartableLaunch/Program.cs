@@ -23,6 +23,9 @@ internal static partial class Program
     private const int IconSmall2 = 2;
     private const int GclpHIcon = -14;
     private const int GclpHIconSmall = -34;
+    private const int SwShownormal = 1;
+    private const int SwShowminimized = 2;
+    private const int SwShowmaximized = 3;
 
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private static readonly JsonSerializerOptions PipeJsonOptions = new();
@@ -267,6 +270,82 @@ internal static partial class Program
         return IntPtr.Zero;
     }
 
+    private static async Task<IntPtr> WaitForLaunchWindowAsync(MonitoredApp app, HashSet<IntPtr> existingWindows, CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var directWindow = app.Process.HasExited ? IntPtr.Zero : FindTopLevelWindow(app.Process.Id);
+            if (directWindow != IntPtr.Zero)
+            {
+                return directWindow;
+            }
+
+            var replacementWindow = FindReplacementLaunchWindow(app, existingWindows);
+            if (replacementWindow != IntPtr.Zero)
+            {
+                return replacementWindow;
+            }
+
+            if (app.Process.HasExited && DateTimeOffset.Now - app.StartedAt > TimeSpan.FromSeconds(3))
+            {
+                return IntPtr.Zero;
+            }
+
+            await Task.Delay(WindowWaitPollMilliseconds, cancellationToken);
+        }
+
+        return IntPtr.Zero;
+    }
+
+    private static IntPtr FindReplacementLaunchWindow(MonitoredApp app, HashSet<IntPtr> existingWindows)
+    {
+        var result = IntPtr.Zero;
+        var requestedProcessName = Path.GetFileNameWithoutExtension(app.Request.Executable);
+
+        EnumWindows((window, _) =>
+        {
+            if (existingWindows.Contains(window) || !IsWindowVisible(window))
+            {
+                return true;
+            }
+
+            var title = GetWindowTitle(window);
+            if (string.IsNullOrWhiteSpace(title))
+            {
+                return true;
+            }
+
+            GetWindowThreadProcessId(window, out var processId);
+            if (processId == Environment.ProcessId)
+            {
+                return true;
+            }
+
+            try
+            {
+                using var process = Process.GetProcessById(processId);
+                if (process.StartTime.ToUniversalTime() < app.StartedAt.UtcDateTime.AddSeconds(-5))
+                {
+                    return true;
+                }
+
+                if (!string.Equals(process.ProcessName, requestedProcessName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+
+                result = window;
+                return false;
+            }
+            catch
+            {
+                return true;
+            }
+        }, IntPtr.Zero);
+
+        return result;
+    }
+
     private static IntPtr FindTopLevelWindow(int processId)
     {
         var result = IntPtr.Zero;
@@ -284,6 +363,24 @@ internal static partial class Program
         }, IntPtr.Zero);
 
         return result;
+    }
+
+    private static HashSet<IntPtr> GetTopLevelWindowHandles()
+    {
+        var shellWindow = GetShellWindow();
+        var windows = new HashSet<IntPtr>();
+
+        EnumWindows((window, _) =>
+        {
+            if (window != shellWindow && IsWindowVisible(window))
+            {
+                windows.Add(window);
+            }
+
+            return true;
+        }, IntPtr.Zero);
+
+        return windows;
     }
 
     private static List<WindowCandidate> GetOpenWindowCandidates()
@@ -402,7 +499,25 @@ internal static partial class Program
 
     private static WindowBounds? TryGetWindowBounds(IntPtr window)
     {
-        if (window == IntPtr.Zero || !GetWindowRect(window, out var rect))
+        if (window == IntPtr.Zero)
+        {
+            return null;
+        }
+
+        NativeRect rect;
+        var state = WindowShowState.Normal;
+        var placement = WindowPlacement.Create();
+        if (GetWindowPlacement(window, ref placement))
+        {
+            rect = placement.NormalPosition;
+            state = placement.ShowCommand switch
+            {
+                SwShowmaximized => WindowShowState.Maximized,
+                SwShowminimized => WindowShowState.Minimized,
+                _ => WindowShowState.Normal,
+            };
+        }
+        else if (!GetWindowRect(window, out rect))
         {
             return null;
         }
@@ -410,7 +525,7 @@ internal static partial class Program
         var width = rect.Right - rect.Left;
         var height = rect.Bottom - rect.Top;
         return width > 0 && height > 0
-            ? new WindowBounds(rect.Left, rect.Top, width, height)
+            ? new WindowBounds(rect.Left, rect.Top, width, height, state)
             : null;
     }
 
@@ -422,6 +537,13 @@ internal static partial class Program
         }
 
         MoveWindow(window, bounds.Left, bounds.Top, bounds.Width, bounds.Height, true);
+        var showCommand = bounds.State switch
+        {
+            WindowShowState.Maximized => SwShowmaximized,
+            WindowShowState.Minimized => SwShowminimized,
+            _ => SwShownormal,
+        };
+        ShowWindow(window, showCommand);
     }
 
     private static LaunchRequest? TryCreateRequestFromProcess(Process process)
@@ -700,6 +822,10 @@ internal static partial class Program
 
     [LibraryImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool GetWindowPlacement(IntPtr hWnd, ref WindowPlacement lpwndpl);
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool MoveWindow(IntPtr hWnd, int x, int y, int nWidth, int nHeight, [MarshalAs(UnmanagedType.Bool)] bool repaint);
 
     [LibraryImport("user32.dll", EntryPoint = "SendMessageW")]
@@ -723,6 +849,32 @@ internal static partial class Program
         public int Top;
         public int Right;
         public int Bottom;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativePoint
+    {
+        public int X;
+        public int Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WindowPlacement
+    {
+        public int Length;
+        public int Flags;
+        public int ShowCommand;
+        public NativePoint MinPosition;
+        public NativePoint MaxPosition;
+        public NativeRect NormalPosition;
+
+        public static WindowPlacement Create()
+        {
+            return new WindowPlacement
+            {
+                Length = Marshal.SizeOf<WindowPlacement>(),
+            };
+        }
     }
 
     [ComImport]
@@ -752,6 +904,12 @@ internal static partial class Program
                 return null;
             }
 
+            var accessorDesktopId = VirtualDesktopAccessor.TryGetWindowDesktopId(window);
+            if (accessorDesktopId is not null)
+            {
+                return accessorDesktopId;
+            }
+
             try
             {
                 var manager = CreateManager();
@@ -771,6 +929,11 @@ internal static partial class Program
                 return false;
             }
 
+            if (VirtualDesktopAccessor.TryMoveWindowToDesktop(window, desktopId))
+            {
+                return true;
+            }
+
             try
             {
                 var manager = CreateManager();
@@ -784,6 +947,44 @@ internal static partial class Program
         }
     }
 
+    private static class VirtualDesktopAccessor
+    {
+        public static Guid? TryGetWindowDesktopId(IntPtr window)
+        {
+            try
+            {
+                var desktopId = GetWindowDesktopId(window);
+                return desktopId == Guid.Empty ? null : desktopId;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        public static bool TryMoveWindowToDesktop(IntPtr window, Guid desktopId)
+        {
+            try
+            {
+                var desktopNumber = GetDesktopNumberById(desktopId);
+                return desktopNumber >= 0 && MoveWindowToDesktopNumber(window, desktopNumber) != -1;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        [DllImport("VirtualDesktopAccessor.dll", CallingConvention = CallingConvention.Cdecl)]
+        private static extern Guid GetWindowDesktopId(IntPtr hwnd);
+
+        [DllImport("VirtualDesktopAccessor.dll", CallingConvention = CallingConvention.Cdecl)]
+        private static extern int GetDesktopNumberById(Guid desktopId);
+
+        [DllImport("VirtualDesktopAccessor.dll", CallingConvention = CallingConvention.Cdecl)]
+        private static extern int MoveWindowToDesktopNumber(IntPtr hwnd, int desktopNumber);
+    }
+
     private sealed class ManagerContext : ApplicationContext
     {
         private readonly NotifyIcon notifyIcon;
@@ -791,6 +992,7 @@ internal static partial class Program
         private readonly List<MonitoredApp> apps = [];
         private readonly SynchronizationContext uiContext;
         private bool sessionEnding;
+        private bool sessionRestored;
 
         public ManagerContext()
         {
@@ -824,18 +1026,20 @@ internal static partial class Program
         {
             try
             {
+                var existingWindows = GetTopLevelWindowHandles();
+                var startedAt = DateTimeOffset.Now;
                 var process = request.Kind == LaunchKind.DefaultOpen
                     ? StartDefaultOpen(request.Executable)
                     : StartExecutable(request);
                 process.EnableRaisingEvents = true;
 
-                var app = new MonitoredApp(request, process, DateTimeOffset.Now, null, null);
+                var app = new MonitoredApp(request, process, startedAt, null, null);
                 apps.Add(app);
-                process.Exited += (_, _) => Post(() => RemoveExitedApp(app));
+                process.Exited += (_, _) => Post(() => RemoveExitedApp(app, process));
 
                 SaveSession();
                 mainForm.RefreshApps();
-                _ = TrackWindowPlacementAsync(app, request.DesktopId, request.WindowBounds);
+                _ = TrackWindowPlacementAsync(app, request.DesktopId, request.WindowBounds, existingWindows);
             }
             catch (Exception ex)
             {
@@ -868,8 +1072,9 @@ internal static partial class Program
 
                 process.EnableRaisingEvents = true;
                 var app = new MonitoredApp(request, process, DateTimeOffset.Now, desktopId, bounds);
+                app.HasResolvedWindow = true;
                 apps.Add(app);
-                process.Exited += (_, _) => Post(() => RemoveExitedApp(app));
+                process.Exited += (_, _) => Post(() => RemoveExitedApp(app, process));
 
                 SaveSession();
                 mainForm.RefreshApps();
@@ -901,6 +1106,12 @@ internal static partial class Program
 
         public void RestoreSavedSession()
         {
+            if (sessionRestored)
+            {
+                return;
+            }
+
+            sessionRestored = true;
             if (!File.Exists(SessionPath))
             {
                 return;
@@ -935,17 +1146,17 @@ internal static partial class Program
 
         protected override void ExitThreadCore()
         {
+            if (!sessionEnding)
+            {
+                RefreshWindowPlacements();
+                SaveSession();
+            }
+
             IsExiting = true;
             notifyIcon.Visible = false;
             notifyIcon.Dispose();
             mainForm.Dispose();
             SystemEvents.SessionEnding -= OnSessionEnding;
-
-            if (!sessionEnding)
-            {
-                TryDelete(SessionPath);
-                TryDelete(ActiveStatePath);
-            }
 
             base.ExitThreadCore();
         }
@@ -1008,9 +1219,14 @@ internal static partial class Program
             mainForm.RefreshApps();
         }
 
-        private void RemoveExitedApp(MonitoredApp app)
+        private void RemoveExitedApp(MonitoredApp app, Process exitedProcess)
         {
             if (sessionEnding)
+            {
+                return;
+            }
+
+            if (!ReferenceEquals(app.Process, exitedProcess) || !app.HasResolvedWindow)
             {
                 return;
             }
@@ -1042,16 +1258,73 @@ internal static partial class Program
             File.WriteAllText(ActiveStatePath, JsonSerializer.Serialize(state, JsonOptions));
         }
 
-        private async Task TrackWindowPlacementAsync(MonitoredApp app, Guid? restoreDesktopId, WindowBounds? restoreBounds)
+        private void RefreshWindowPlacements()
+        {
+            foreach (var app in apps)
+            {
+                if (app.WindowHandle != IntPtr.Zero)
+                {
+                    UpdateWindowPlacement(app, app.WindowHandle, app.DesktopId, app.WindowBounds, save: false);
+                }
+            }
+        }
+
+        private void UpdateWindowPlacement(MonitoredApp app, IntPtr window, Guid? fallbackDesktopId, WindowBounds? fallbackBounds, bool save)
+        {
+            var currentDesktopId = VirtualDesktopPlacement.TryGetDesktopId(window) ?? fallbackDesktopId;
+            var currentBounds = TryGetWindowBounds(window) ?? fallbackBounds;
+            if (app.DesktopId == currentDesktopId && Equals(app.WindowBounds, currentBounds))
+            {
+                return;
+            }
+
+            app.DesktopId = currentDesktopId;
+            app.WindowBounds = currentBounds;
+            if (save)
+            {
+                SaveSession();
+                mainForm.RefreshApps();
+            }
+        }
+
+        private async Task TrackWindowPlacementAsync(MonitoredApp app, Guid? restoreDesktopId, WindowBounds? restoreBounds, HashSet<IntPtr> existingWindows)
         {
             try
             {
                 using var cancellation = new CancellationTokenSource(WindowWaitTimeoutMilliseconds + 5000);
-                var window = await WaitForMainWindowAsync(app.Process, cancellation.Token);
+                var window = await WaitForLaunchWindowAsync(app, existingWindows, cancellation.Token);
                 if (window == IntPtr.Zero)
                 {
+                    Post(() =>
+                    {
+                        if (!app.HasResolvedWindow && app.Process.HasExited)
+                        {
+                            Remove(app);
+                        }
+                    });
                     return;
                 }
+
+                GetWindowThreadProcessId(window, out var windowProcessId);
+                if (windowProcessId > 0 && windowProcessId != app.Process.Id)
+                {
+                    try
+                    {
+                        var previousProcess = app.Process;
+                        var resolvedProcess = Process.GetProcessById(windowProcessId);
+                        resolvedProcess.EnableRaisingEvents = true;
+                        resolvedProcess.Exited += (_, _) => Post(() => RemoveExitedApp(app, resolvedProcess));
+                        app.Process = resolvedProcess;
+                        previousProcess.Dispose();
+                    }
+                    catch
+                    {
+                        // Keep tracking the original process if the replacement process disappears.
+                    }
+                }
+
+                app.HasResolvedWindow = true;
+                app.WindowHandle = window;
 
                 if (restoreDesktopId is { } targetDesktopId)
                 {
@@ -1061,19 +1334,24 @@ internal static partial class Program
                 TryMoveWindow(window, restoreBounds);
 
                 await Task.Delay(500, cancellation.Token);
-                var currentDesktopId = VirtualDesktopPlacement.TryGetDesktopId(window) ?? restoreDesktopId;
-                if (currentDesktopId is null)
-                {
-                    return;
-                }
+                TryMoveWindow(window, restoreBounds);
 
                 Post(() =>
                 {
-                    app.DesktopId = currentDesktopId;
-                    app.WindowBounds = TryGetWindowBounds(window) ?? restoreBounds;
-                    SaveSession();
-                    mainForm.RefreshApps();
+                    UpdateWindowPlacement(app, window, restoreDesktopId, restoreBounds, save: true);
                 });
+
+                while (!IsExiting && !app.Process.HasExited)
+                {
+                    await Task.Delay(1000);
+                    Post(() =>
+                    {
+                        if (apps.Contains(app) && !app.Process.HasExited)
+                        {
+                            UpdateWindowPlacement(app, window, app.DesktopId, app.WindowBounds, save: true);
+                        }
+                    });
+                }
             }
             catch
             {
@@ -1446,7 +1724,7 @@ internal static partial class Program
         {
             if (args.Length == 0)
             {
-                return new AppCommand(null, false, CommandMode.ShowGui);
+                return new AppCommand(null, true, CommandMode.ShowGui);
             }
 
             if (Is(args[0], "--restore"))
@@ -1523,14 +1801,31 @@ internal static partial class Program
 
     private sealed record ActiveAppState(int ProcessId, DateTimeOffset StartedAt, LaunchRequest Request, Guid? DesktopId, WindowBounds? WindowBounds);
 
-    private sealed record MonitoredApp(LaunchRequest Request, Process Process, DateTimeOffset StartedAt, Guid? DesktopId, WindowBounds? WindowBounds)
+    private sealed class MonitoredApp(LaunchRequest request, Process process, DateTimeOffset startedAt, Guid? desktopId, WindowBounds? windowBounds)
     {
-        public Guid? DesktopId { get; set; } = DesktopId;
+        public LaunchRequest Request { get; set; } = request;
 
-        public WindowBounds? WindowBounds { get; set; } = WindowBounds;
+        public Process Process { get; set; } = process;
+
+        public DateTimeOffset StartedAt { get; } = startedAt;
+
+        public Guid? DesktopId { get; set; } = desktopId;
+
+        public WindowBounds? WindowBounds { get; set; } = windowBounds;
+
+        public IntPtr WindowHandle { get; set; }
+
+        public bool HasResolvedWindow { get; set; }
     }
 
-    private sealed record WindowBounds(int Left, int Top, int Width, int Height);
+    private enum WindowShowState
+    {
+        Normal,
+        Minimized,
+        Maximized,
+    }
+
+    private sealed record WindowBounds(int Left, int Top, int Width, int Height, WindowShowState State = WindowShowState.Normal);
 
     private sealed record WindowCandidate(IntPtr Handle, int ProcessId, string ProcessName, string Title);
 }

@@ -66,9 +66,10 @@ default-open request for restart.
 ## Virtual desktops
 
 RestartableLaunch always tries to remember the virtual desktop of each monitored
-window and move it back there during restore. This uses Windows shell COM
-virtual desktop APIs directly. If Windows refuses a move, the application still
-launches normally.
+window and move it back there during restore. It first uses
+`VirtualDesktopAccessor.dll` for the undocumented Windows virtual desktop
+operations, then falls back to the Windows shell COM APIs. If Windows refuses a
+move, the application still launches normally.
 
 ## Notes
 
@@ -81,6 +82,10 @@ launches normally.
 - Unsaved application state is still the responsibility of the wrapped app.
 - Virtual desktop placement is best effort because Windows may reject desktop
   moves after system updates or when the saved desktop no longer exists.
+- `VirtualDesktopAccessor.dll` is bundled from
+  [Ciantic/VirtualDesktopAccessor](https://github.com/Ciantic/VirtualDesktopAccessor),
+  MIT licensed. The license text is included under
+  `third-party/VirtualDesktopAccessor/LICENSE`.
 
 ## Build
 

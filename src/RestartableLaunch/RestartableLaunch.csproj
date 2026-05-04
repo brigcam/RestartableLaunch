@@ -12,4 +12,9 @@
     <ApplicationIcon>assets\RestartableLaunch.ico</ApplicationIcon>
   </PropertyGroup>
 
+  <Target Name="CopyVirtualDesktopAccessor" AfterTargets="Build;Publish">
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\native\VirtualDesktopAccessor.dll" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\native\VirtualDesktopAccessor.dll" DestinationFolder="$(PublishDir)" SkipUnchangedFiles="true" Condition="'$(PublishDir)' != ''" />
+  </Target>
+
 </Project>
