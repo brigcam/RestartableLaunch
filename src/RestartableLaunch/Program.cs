@@ -27,6 +27,7 @@ internal static partial class Program
     private const int SwShownormal = 1;
     private const int SwShowminimized = 2;
     private const int SwShowmaximized = 3;
+    private const int SwRestore = 9;
 
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private static readonly JsonSerializerOptions PipeJsonOptions = new();
@@ -799,6 +800,27 @@ internal static partial class Program
         ShowWindow(window, showCommand);
     }
 
+    private static void TryBringWindowToFront(IntPtr window)
+    {
+        if (window == IntPtr.Zero)
+        {
+            return;
+        }
+
+        if (VirtualDesktopPlacement.TryGetDesktopId(window) is { } desktopId)
+        {
+            VirtualDesktopPlacement.TrySwitchToDesktop(desktopId);
+        }
+
+        if (IsIconic(window))
+        {
+            ShowWindow(window, SwRestore);
+        }
+
+        BringWindowToTop(window);
+        SetForegroundWindow(window);
+    }
+
     private static LaunchRequest? TryCreateRequestFromProcess(Process process)
     {
         var commandLine = TryGetProcessCommandLine(process.Id);
@@ -1055,6 +1077,18 @@ internal static partial class Program
 
     [LibraryImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool SetForegroundWindow(IntPtr hWnd);
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool BringWindowToTop(IntPtr hWnd);
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool IsIconic(IntPtr hWnd);
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool IsWindowVisible(IntPtr hWnd);
 
     [LibraryImport("user32.dll")]
@@ -1202,6 +1236,16 @@ internal static partial class Program
                 return false;
             }
         }
+
+        public static bool TrySwitchToDesktop(Guid desktopId)
+        {
+            if (desktopId == Guid.Empty)
+            {
+                return false;
+            }
+
+            return VirtualDesktopAccessor.TrySwitchToDesktop(desktopId);
+        }
     }
 
     private static class VirtualDesktopAccessor
@@ -1232,6 +1276,19 @@ internal static partial class Program
             }
         }
 
+        public static bool TrySwitchToDesktop(Guid desktopId)
+        {
+            try
+            {
+                var desktopNumber = GetDesktopNumberById(desktopId);
+                return desktopNumber >= 0 && GoToDesktopNumber(desktopNumber) != -1;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         [DllImport("VirtualDesktopAccessor.dll", CallingConvention = CallingConvention.Cdecl)]
         private static extern Guid GetWindowDesktopId(IntPtr hwnd);
 
@@ -1240,6 +1297,9 @@ internal static partial class Program
 
         [DllImport("VirtualDesktopAccessor.dll", CallingConvention = CallingConvention.Cdecl)]
         private static extern int MoveWindowToDesktopNumber(IntPtr hwnd, int desktopNumber);
+
+        [DllImport("VirtualDesktopAccessor.dll", CallingConvention = CallingConvention.Cdecl)]
+        private static extern int GoToDesktopNumber(int desktopNumber);
     }
 
     private sealed class ManagerContext : ApplicationContext
@@ -2577,6 +2637,7 @@ internal static partial class Program
         private ContextMenuStrip BuildContextMenu()
         {
             var menu = new ContextMenuStrip();
+            var bringToFrontItem = new ToolStripMenuItem("Bring to front");
             var monitorAllItem = new ToolStripMenuItem();
             menu.Opening += (_, e) =>
             {
@@ -2603,8 +2664,22 @@ internal static partial class Program
                 AcceptSelection();
             };
 
+            bringToFrontItem.Click += (_, _) => BringSelectedWindowToFront();
+
+            menu.Items.Add(bringToFrontItem);
+            menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(monitorAllItem);
             return menu;
+        }
+
+        private void BringSelectedWindowToFront()
+        {
+            if (GetSelectedCandidate() is not { } candidate)
+            {
+                return;
+            }
+
+            TryBringWindowToFront(candidate.Handle);
         }
 
         private void AcceptSelection()
