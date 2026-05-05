@@ -2370,6 +2370,7 @@ internal static partial class Program
         private ContextMenuStrip BuildListContextMenu()
         {
             var menu = new ContextMenuStrip();
+            var bringToFrontItem = new ToolStripMenuItem("Bring to front");
             var monitorAllItem = new ToolStripMenuItem();
             var separator = new ToolStripSeparator();
             menu.Opening += (_, e) =>
@@ -2381,12 +2382,14 @@ internal static partial class Program
                 }
 
                 var selectedApp = GetSelectedMonitoredApp();
+                bringToFrontItem.Visible = selectedApp is not null;
                 monitorAllItem.Visible = selectedApp is not null && selectedApp.RuleId is null;
-                separator.Visible = monitorAllItem.Visible;
+                separator.Visible = selectedApp is not null;
                 monitorAllItem.Text = selectedApp is null
                     ? "Monitor all instances"
                     : $"Monitor all instances of {selectedApp.Process.ProcessName}.exe";
             };
+            bringToFrontItem.Click += (_, _) => BringSelectedMonitoredAppToFront();
             monitorAllItem.Click += (_, _) =>
             {
                 if (GetSelectedMonitoredApp() is { } app)
@@ -2394,6 +2397,7 @@ internal static partial class Program
                     context.MonitorAllInstances(app);
                 }
             };
+            menu.Items.Add(bringToFrontItem);
             menu.Items.Add(monitorAllItem);
             menu.Items.Add(separator);
             menu.Items.Add("Remove", null, (_, _) => RemoveSelectedApps());
@@ -2440,6 +2444,36 @@ internal static partial class Program
                 .Select(static item => item.Tag)
                 .OfType<MonitoredApp>()
                 .FirstOrDefault();
+        }
+
+        private void BringSelectedMonitoredAppToFront()
+        {
+            if (GetSelectedMonitoredApp() is not { } app)
+            {
+                return;
+            }
+
+            try
+            {
+                if (app.Process.HasExited)
+                {
+                    return;
+                }
+
+                var window = app.WindowHandle != IntPtr.Zero
+                    ? app.WindowHandle
+                    : FindTopLevelWindow(app.Process.Id);
+                if (window != IntPtr.Zero)
+                {
+                    app.WindowHandle = window;
+                    app.HasResolvedWindow = true;
+                    TryBringWindowToFront(window);
+                }
+            }
+            catch
+            {
+                // Best-effort UI helper only.
+            }
         }
 
         private void RefreshExplorerContextMenuState()
@@ -2637,7 +2671,6 @@ internal static partial class Program
         private ContextMenuStrip BuildContextMenu()
         {
             var menu = new ContextMenuStrip();
-            var bringToFrontItem = new ToolStripMenuItem("Bring to front");
             var monitorAllItem = new ToolStripMenuItem();
             menu.Opening += (_, e) =>
             {
@@ -2664,22 +2697,8 @@ internal static partial class Program
                 AcceptSelection();
             };
 
-            bringToFrontItem.Click += (_, _) => BringSelectedWindowToFront();
-
-            menu.Items.Add(bringToFrontItem);
-            menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(monitorAllItem);
             return menu;
-        }
-
-        private void BringSelectedWindowToFront()
-        {
-            if (GetSelectedCandidate() is not { } candidate)
-            {
-                return;
-            }
-
-            TryBringWindowToFront(candidate.Handle);
         }
 
         private void AcceptSelection()
