@@ -821,16 +821,26 @@ internal static partial class Program
         SetForegroundWindow(window);
     }
 
-    private static LaunchRequest? TryCreateRequestFromProcess(Process process)
+    private static LaunchRequest? TryCreateRequestFromProcess(Process process, bool requireCommandLine = false)
     {
         var commandLine = TryGetProcessCommandLine(process.Id);
-        var args = string.IsNullOrWhiteSpace(commandLine) ? [] : CommandLineToArguments(commandLine);
+        if (string.IsNullOrWhiteSpace(commandLine))
+        {
+            return requireCommandLine ? null : TryCreateFallbackRequestFromProcess(process);
+        }
+
+        var args = CommandLineToArguments(commandLine);
 
         if (args.Length > 0)
         {
             return new LaunchRequest(args[0], args.Skip(1).ToArray(), null, LaunchKind.Executable, null);
         }
 
+        return requireCommandLine ? null : TryCreateFallbackRequestFromProcess(process);
+    }
+
+    private static LaunchRequest? TryCreateFallbackRequestFromProcess(Process process)
+    {
         try
         {
             return new LaunchRequest(process.MainModule?.FileName ?? process.ProcessName, [], null, LaunchKind.Executable, null);
@@ -1525,6 +1535,12 @@ internal static partial class Program
                         continue;
                     }
 
+                    if (savedApp.RuleId is not null && (savedApp.Arguments?.Length ?? 0) == 0)
+                    {
+                        LogMessage("restore-skip", $"Skipped rule-backed app without arguments because it could not be reattached: {savedApp.Executable}");
+                        continue;
+                    }
+
                     Launch(savedApp.ToLaunchRequest(), savedApp.RuleId);
                 }
 
@@ -1644,10 +1660,28 @@ internal static partial class Program
             try
             {
                 var process = Process.GetProcessById(savedApp.ProcessId);
-                if (process.HasExited || !MatchesSavedProcess(process, savedApp))
+                if (process.HasExited)
                 {
                     process.Dispose();
                     return false;
+                }
+
+                var request = savedApp.ToLaunchRequest();
+                if (!MatchesSavedProcess(process, savedApp))
+                {
+                    var repairedRequest = TryCreateRequestFromProcess(process, requireCommandLine: true);
+                    if (repairedRequest is null || !MatchesSavedProcessName(process, savedApp))
+                    {
+                        process.Dispose();
+                        return false;
+                    }
+
+                    request = repairedRequest with
+                    {
+                        DesktopId = savedApp.DesktopId,
+                        WindowBounds = savedApp.WindowBounds,
+                    };
+                    LogMessage("restore-repair", $"Repaired saved command line for PID {process.Id}: {FormatRequest(request)}");
                 }
 
                 if (apps.Any(app => !app.Process.HasExited && app.Process.Id == process.Id))
@@ -1656,7 +1690,6 @@ internal static partial class Program
                     return true;
                 }
 
-                var request = savedApp.ToLaunchRequest();
                 process.EnableRaisingEvents = true;
                 var startedAt = TryGetProcessStartedAt(process)
                     ?? (savedApp.StartedAt == default ? DateTimeOffset.Now : savedApp.StartedAt);
@@ -1782,9 +1815,7 @@ internal static partial class Program
 
         private static bool MatchesSavedProcess(Process process, SavedApp savedApp)
         {
-            var expectedProcessName = Path.GetFileNameWithoutExtension(savedApp.Executable);
-            if (!string.IsNullOrWhiteSpace(expectedProcessName)
-                && !string.Equals(process.ProcessName, expectedProcessName, StringComparison.OrdinalIgnoreCase))
+            if (!MatchesSavedProcessName(process, savedApp))
             {
                 return false;
             }
@@ -1806,6 +1837,13 @@ internal static partial class Program
             }
 
             return true;
+        }
+
+        private static bool MatchesSavedProcessName(Process process, SavedApp savedApp)
+        {
+            var expectedProcessName = Path.GetFileNameWithoutExtension(savedApp.Executable);
+            return string.IsNullOrWhiteSpace(expectedProcessName)
+                || string.Equals(process.ProcessName, expectedProcessName, StringComparison.OrdinalIgnoreCase);
         }
 
         private bool IsAlreadyMonitoredProcess(int processId)
@@ -1921,7 +1959,7 @@ internal static partial class Program
                 return false;
             }
 
-            var request = TryCreateRequestFromProcess(process);
+            var request = TryCreateRequestFromProcess(process, requireCommandLine: ruleId is not null);
             if (request is null)
             {
                 return false;
@@ -1933,7 +1971,7 @@ internal static partial class Program
             request = request with { DesktopId = desktopId, WindowBounds = bounds };
 
             process.EnableRaisingEvents = true;
-            var app = new MonitoredApp(request, process, DateTimeOffset.Now, desktopId, bounds, ruleId);
+            var app = new MonitoredApp(request, process, TryGetProcessStartedAt(process) ?? DateTimeOffset.Now, desktopId, bounds, ruleId);
             if (window != IntPtr.Zero)
             {
                 app.WindowHandle = window;
