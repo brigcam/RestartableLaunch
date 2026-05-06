@@ -1959,13 +1959,18 @@ internal static partial class Program
                 return false;
             }
 
+            var window = FindTopLevelWindow(process.Id);
+            if (ruleId is not null && window == IntPtr.Zero)
+            {
+                return false;
+            }
+
             var request = TryCreateRequestFromProcess(process, requireCommandLine: ruleId is not null);
             if (request is null)
             {
                 return false;
             }
 
-            var window = FindTopLevelWindow(process.Id);
             var desktopId = VirtualDesktopPlacement.TryGetDesktopId(window);
             var bounds = TryGetWindowBounds(window);
             request = request with { DesktopId = desktopId, WindowBounds = bounds };
