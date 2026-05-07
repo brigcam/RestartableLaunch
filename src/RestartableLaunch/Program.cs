@@ -616,7 +616,21 @@ internal static partial class Program
             return true;
         }, IntPtr.Zero);
 
-        return result;
+        if (result != IntPtr.Zero)
+        {
+            return result;
+        }
+
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            process.Refresh();
+            return process.MainWindowHandle;
+        }
+        catch
+        {
+            return IntPtr.Zero;
+        }
     }
 
     private static HashSet<IntPtr> GetTopLevelWindowHandles()
@@ -867,15 +881,66 @@ internal static partial class Program
 
             foreach (dynamic result in results)
             {
-                return result.CommandLine as string;
+                var commandLine = result.CommandLine as string;
+                if (!string.IsNullOrWhiteSpace(commandLine))
+                {
+                    return commandLine;
+                }
             }
+        }
+        catch
+        {
+            // Fall back below.
+        }
+
+        return TryGetProcessCommandLineFromPowerShell(processId);
+    }
+
+    private static string? TryGetProcessCommandLineFromPowerShell(int processId)
+    {
+        try
+        {
+            using var process = new Process();
+            process.StartInfo = new ProcessStartInfo
+            {
+                FileName = "powershell.exe",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            process.StartInfo.ArgumentList.Add("-NoProfile");
+            process.StartInfo.ArgumentList.Add("-ExecutionPolicy");
+            process.StartInfo.ArgumentList.Add("Bypass");
+            process.StartInfo.ArgumentList.Add("-Command");
+            process.StartInfo.ArgumentList.Add($"(Get-CimInstance Win32_Process -Filter \"ProcessId = {processId}\").CommandLine");
+
+            if (!process.Start())
+            {
+                return null;
+            }
+
+            if (!process.WaitForExit(2500))
+            {
+                try
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+                catch
+                {
+                    // Best effort.
+                }
+
+                return null;
+            }
+
+            var output = process.StandardOutput.ReadToEnd().Trim();
+            return string.IsNullOrWhiteSpace(output) ? null : output;
         }
         catch
         {
             return null;
         }
-
-        return null;
     }
 
     private static string[] CommandLineToArguments(string commandLine)
