@@ -10,8 +10,6 @@ namespace RestartableLaunch;
 
 internal static partial class Program
 {
-    private const int RestartNoCrash = 1;
-    private const int RestartNoHang = 2;
     private const string MutexName = @"Local\RestartableLaunch.Manager";
     private const string PipeName = "RestartableLaunch.Manager";
     private const int SwHide = 0;
@@ -1134,12 +1132,6 @@ internal static partial class Program
         }
     }
 
-    [LibraryImport("kernel32.dll", StringMarshalling = StringMarshalling.Utf16)]
-    private static partial int RegisterApplicationRestart(string commandLineArgs, int flags);
-
-    [LibraryImport("kernel32.dll")]
-    private static partial int UnregisterApplicationRestart();
-
     [LibraryImport("user32.dll", EntryPoint = "MessageBoxW", StringMarshalling = StringMarshalling.Utf16)]
     private static partial int MessageBox(IntPtr hWnd, string text, string caption, uint type);
 
@@ -1415,7 +1407,18 @@ internal static partial class Program
 
         public void Post(Action action)
         {
-            uiContext.Post(_ => action(), null);
+            if (IsExiting)
+            {
+                return;
+            }
+
+            uiContext.Post(_ =>
+            {
+                if (!IsExiting)
+                {
+                    action();
+                }
+            }, null);
         }
 
         public void Launch(LaunchRequest request)
@@ -1627,13 +1630,14 @@ internal static partial class Program
 
         protected override void ExitThreadCore()
         {
+            IsExiting = true;
+
             if (!sessionEnding)
             {
                 RefreshWindowPlacements();
                 SaveSession();
             }
 
-            IsExiting = true;
             notifyIcon.Visible = false;
             notifyIcon.Dispose();
             mainForm.Dispose();
@@ -1936,6 +1940,11 @@ internal static partial class Program
             while (!IsExiting)
             {
                 await Task.Delay(2000);
+                if (IsExiting)
+                {
+                    break;
+                }
+
                 Post(() =>
                 {
                     RefreshIconCache();
@@ -2184,7 +2193,10 @@ internal static partial class Program
 
                 Post(() =>
                 {
-                    UpdateWindowPlacement(app, window, restoreDesktopId, restoreBounds, save: true);
+                    if (!IsExiting)
+                    {
+                        UpdateWindowPlacement(app, window, restoreDesktopId, restoreBounds, save: true);
+                    }
                 });
 
                 while (!IsExiting && !app.Process.HasExited)
@@ -2208,7 +2220,17 @@ internal static partial class Program
         private void OnSessionEnding(object sender, SessionEndingEventArgs e)
         {
             sessionEnding = true;
-            SaveSession();
+            IsExiting = true;
+            try
+            {
+                LogMessage("session-ending", $"Reason: {e.Reason}");
+                SaveSession();
+            }
+            catch (Exception ex)
+            {
+                LogException("session-ending-save", ex);
+            }
+
             ExitThread();
         }
     }
