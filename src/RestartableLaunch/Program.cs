@@ -2123,6 +2123,84 @@ internal static partial class Program
             }
         }
 
+        private void LogShutdownSnapshot(SessionEndReasons reason)
+        {
+            var builder = new StringBuilder()
+                .AppendLine($"Reason: {reason}")
+                .AppendLine($"Monitored apps: {apps.Count}")
+                .AppendLine($"All-instance rules: {monitorRules.Count}");
+
+            foreach (var app in apps.ToArray())
+            {
+                builder.AppendLine()
+                    .AppendLine($"App PID: {SafeGetProcessId(app.Process)}")
+                    .AppendLine($"Process: {SafeGetProcessName(app.Process)}")
+                    .AppendLine($"Has exited: {SafeHasExited(app.Process)}")
+                    .AppendLine($"Started: {app.StartedAt:O}")
+                    .AppendLine($"Mode: {(app.RuleId is null ? "Single" : "All instances")}")
+                    .AppendLine($"RuleId: {app.RuleId?.ToString("D") ?? "(none)"}")
+                    .AppendLine($"WindowHandle: 0x{app.WindowHandle.ToInt64():X}")
+                    .AppendLine($"HasResolvedWindow: {app.HasResolvedWindow}")
+                    .AppendLine($"DesktopId: {app.DesktopId?.ToString() ?? "unknown"}")
+                    .AppendLine($"WindowBounds: {FormatWindowBounds(app.WindowBounds)}")
+                    .AppendLine($"Command: {FormatRequest(app.Request)}");
+            }
+
+            if (monitorRules.Count > 0)
+            {
+                builder.AppendLine().AppendLine("Rules:");
+                foreach (var rule in monitorRules.ToArray())
+                {
+                    builder.AppendLine($"- {rule.ProcessName}: {rule.ExecutablePath} ({rule.Id:D})");
+                }
+            }
+
+            LogMessage("shutdown-snapshot", builder.ToString());
+        }
+
+        private static int SafeGetProcessId(Process process)
+        {
+            try
+            {
+                return process.Id;
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
+        private static string SafeGetProcessName(Process process)
+        {
+            try
+            {
+                return process.ProcessName;
+            }
+            catch
+            {
+                return "(unavailable)";
+            }
+        }
+
+        private static bool? SafeHasExited(Process process)
+        {
+            try
+            {
+                return process.HasExited;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string FormatWindowBounds(WindowBounds? bounds)
+        {
+            return bounds is null
+                ? "unknown"
+                : $"{bounds.Left},{bounds.Top} {bounds.Width}x{bounds.Height} {bounds.State}";
+        }
+
         private void UpdateWindowPlacement(MonitoredApp app, IntPtr window, Guid? fallbackDesktopId, WindowBounds? fallbackBounds, bool save)
         {
             var currentDesktopId = VirtualDesktopPlacement.TryGetDesktopId(window) ?? fallbackDesktopId;
@@ -2223,7 +2301,7 @@ internal static partial class Program
             IsExiting = true;
             try
             {
-                LogMessage("session-ending", $"Reason: {e.Reason}");
+                LogShutdownSnapshot(e.Reason);
                 SaveSession();
             }
             catch (Exception ex)
