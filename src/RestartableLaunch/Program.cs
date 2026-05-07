@@ -1423,10 +1423,10 @@ internal static partial class Program
 
         public void Launch(LaunchRequest request)
         {
-            Launch(request, ruleId: null);
+            Launch(request, ruleId: null, applyRestorePlacement: false);
         }
 
-        private void Launch(LaunchRequest request, Guid? ruleId)
+        private void Launch(LaunchRequest request, Guid? ruleId, bool applyRestorePlacement)
         {
             try
             {
@@ -1443,7 +1443,7 @@ internal static partial class Program
 
                 SaveSession();
                 mainForm.RefreshApps();
-                _ = TrackWindowPlacementAsync(app, request.DesktopId, request.WindowBounds, existingWindows);
+                _ = TrackWindowPlacementAsync(app, request.DesktopId, request.WindowBounds, existingWindows, applyRestorePlacement);
             }
             catch (Exception ex)
             {
@@ -1609,7 +1609,7 @@ internal static partial class Program
                         continue;
                     }
 
-                    Launch(savedApp.ToLaunchRequest(), savedApp.RuleId);
+                    Launch(savedApp.ToLaunchRequest(), savedApp.RuleId, applyRestorePlacement: true);
                 }
 
                 ScanMonitorRules(save: true);
@@ -1782,7 +1782,7 @@ internal static partial class Program
                 }
                 else
                 {
-                    _ = TrackWindowPlacementAsync(app, savedApp.DesktopId, savedApp.WindowBounds, GetTopLevelWindowHandles());
+                    _ = TrackWindowPlacementAsync(app, savedApp.DesktopId, savedApp.WindowBounds, GetTopLevelWindowHandles(), applyRestorePlacement: false);
                 }
 
                 SaveSession();
@@ -2059,7 +2059,7 @@ internal static partial class Program
 
             apps.Add(app);
             process.Exited += (_, _) => Post(() => RemoveExitedApp(app, process));
-            _ = TrackWindowPlacementAsync(app, desktopId, bounds, GetTopLevelWindowHandles());
+            _ = TrackWindowPlacementAsync(app, desktopId, bounds, GetTopLevelWindowHandles(), applyRestorePlacement: false);
             return true;
         }
 
@@ -2219,7 +2219,12 @@ internal static partial class Program
             }
         }
 
-        private async Task TrackWindowPlacementAsync(MonitoredApp app, Guid? restoreDesktopId, WindowBounds? restoreBounds, HashSet<IntPtr> existingWindows)
+        private async Task TrackWindowPlacementAsync(
+            MonitoredApp app,
+            Guid? restoreDesktopId,
+            WindowBounds? restoreBounds,
+            HashSet<IntPtr> existingWindows,
+            bool applyRestorePlacement)
         {
             try
             {
@@ -2259,15 +2264,18 @@ internal static partial class Program
                 app.HasResolvedWindow = true;
                 app.WindowHandle = window;
 
-                if (restoreDesktopId is { } targetDesktopId)
+                if (applyRestorePlacement && restoreDesktopId is { } targetDesktopId)
                 {
                     VirtualDesktopPlacement.TryMoveToDesktop(window, targetDesktopId);
                 }
 
-                TryMoveWindow(window, restoreBounds);
+                if (applyRestorePlacement)
+                {
+                    TryMoveWindow(window, restoreBounds);
 
-                await Task.Delay(500, cancellation.Token);
-                TryMoveWindow(window, restoreBounds);
+                    await Task.Delay(500, cancellation.Token);
+                    TryMoveWindow(window, restoreBounds);
+                }
 
                 Post(() =>
                 {
