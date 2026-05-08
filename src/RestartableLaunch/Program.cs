@@ -802,14 +802,44 @@ internal static partial class Program
             return;
         }
 
+        if (TrySetWindowPlacement(window, bounds))
+        {
+            return;
+        }
+
         MoveWindow(window, bounds.Left, bounds.Top, bounds.Width, bounds.Height, true);
-        var showCommand = bounds.State switch
+        ShowWindow(window, GetShowCommand(bounds.State));
+    }
+
+    private static bool TrySetWindowPlacement(IntPtr window, WindowBounds bounds)
+    {
+        var placement = WindowPlacement.Create();
+        if (!GetWindowPlacement(window, ref placement))
+        {
+            return false;
+        }
+
+        placement.Flags = 0;
+        placement.ShowCommand = GetShowCommand(bounds.State);
+        placement.NormalPosition = new NativeRect
+        {
+            Left = bounds.Left,
+            Top = bounds.Top,
+            Right = bounds.Left + bounds.Width,
+            Bottom = bounds.Top + bounds.Height,
+        };
+
+        return SetWindowPlacement(window, ref placement);
+    }
+
+    private static int GetShowCommand(WindowShowState state)
+    {
+        return state switch
         {
             WindowShowState.Maximized => SwShowmaximized,
             WindowShowState.Minimized => SwShowminimized,
             _ => SwShownormal,
         };
-        ShowWindow(window, showCommand);
     }
 
     private static void TryBringWindowToFront(IntPtr window)
@@ -1184,6 +1214,10 @@ internal static partial class Program
 
     [LibraryImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool SetWindowPlacement(IntPtr hWnd, ref WindowPlacement lpwndpl);
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool MoveWindow(IntPtr hWnd, int x, int y, int nWidth, int nHeight, [MarshalAs(UnmanagedType.Bool)] bool repaint);
 
     [LibraryImport("user32.dll", EntryPoint = "SendMessageW")]
@@ -1437,7 +1471,9 @@ internal static partial class Program
                 process.EnableRaisingEvents = true;
                 var startedAt = TryGetProcessStartedAt(process) ?? DateTimeOffset.Now;
 
-                var app = new MonitoredApp(request, process, startedAt, null, null, ruleId);
+                var initialDesktopId = applyRestorePlacement ? request.DesktopId : null;
+                var initialBounds = applyRestorePlacement ? request.WindowBounds : null;
+                var app = new MonitoredApp(request, process, startedAt, initialDesktopId, initialBounds, ruleId);
                 apps.Add(app);
                 process.Exited += (_, _) => Post(() => RemoveExitedApp(app, process));
 
