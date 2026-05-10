@@ -15,6 +15,10 @@ internal static partial class Program
     private const int SwHide = 0;
     private const int WindowWaitTimeoutMilliseconds = 30000;
     private const int WindowWaitPollMilliseconds = 250;
+    private const int RestoreLaunchWindowWaitMilliseconds = 12000;
+    private const int RestoreLaunchSpacingMilliseconds = 1500;
+    private const int RestorePlacementProtectionMilliseconds = 45000;
+    private const int WindowPlacementTolerancePixels = 16;
     private const string StartupRunName = "RestartableLaunch";
     private const int WmGetIcon = 0x007F;
     private const int IconSmall = 0;
@@ -31,6 +35,7 @@ internal static partial class Program
     private static readonly JsonSerializerOptions PipeJsonOptions = new();
     private static readonly Icon AppIcon = LoadAppIcon();
     private static readonly object LogLock = new();
+    private static readonly int[] RestorePlacementRetryDelaysMilliseconds = [0, 250, 750, 1500, 3000, 5000];
 
     [STAThread]
     private static int Main(string[] args)
@@ -184,12 +189,16 @@ internal static partial class Program
 
                 context.Post(() =>
                 {
-                    if (command.Launch is not null)
+                    if (command.Restore)
+                    {
+                        context.RestoreSavedSession();
+                    }
+                    else if (command.Launch is not null)
                     {
                         context.Launch(command.Launch);
                     }
 
-                    if (command.Mode == CommandMode.ShowGui || command.Launch is null)
+                    if (command.Mode == CommandMode.ShowGui || (!command.Restore && command.Launch is null))
                     {
                         context.ShowMainWindow();
                     }
@@ -1412,6 +1421,7 @@ internal static partial class Program
         private readonly SynchronizationContext uiContext;
         private bool sessionEnding;
         private bool sessionRestored;
+        private bool restoringSession;
 
         public ManagerContext()
         {
@@ -1457,10 +1467,10 @@ internal static partial class Program
 
         public void Launch(LaunchRequest request)
         {
-            Launch(request, ruleId: null, applyRestorePlacement: false);
+            _ = Launch(request, ruleId: null, applyRestorePlacement: false);
         }
 
-        private void Launch(LaunchRequest request, Guid? ruleId, bool applyRestorePlacement)
+        private MonitoredApp? Launch(LaunchRequest request, Guid? ruleId, bool applyRestorePlacement)
         {
             try
             {
@@ -1474,16 +1484,26 @@ internal static partial class Program
                 var initialDesktopId = applyRestorePlacement ? request.DesktopId : null;
                 var initialBounds = applyRestorePlacement ? request.WindowBounds : null;
                 var app = new MonitoredApp(request, process, startedAt, initialDesktopId, initialBounds, ruleId);
+                if (applyRestorePlacement)
+                {
+                    app.PendingRestoreDesktopId = request.DesktopId;
+                    app.PendingRestoreWindowBounds = request.WindowBounds;
+                    app.ProtectRestorePlacementUntil = DateTimeOffset.UtcNow.AddMilliseconds(RestorePlacementProtectionMilliseconds);
+                }
+
                 apps.Add(app);
                 process.Exited += (_, _) => Post(() => RemoveExitedApp(app, process));
 
                 SaveSession();
                 mainForm.RefreshApps();
                 _ = TrackWindowPlacementAsync(app, request.DesktopId, request.WindowBounds, existingWindows, applyRestorePlacement);
+                return app;
             }
             catch (Exception ex)
             {
                 MessageBox(IntPtr.Zero, ex.Message, "RestartableLaunch", 0x10);
+                LogException("launch-failed", ex, FormatRequest(request));
+                return null;
             }
         }
 
@@ -1520,9 +1540,12 @@ internal static partial class Program
                 process.EnableRaisingEvents = true;
                 var rule = monitorAllInstances ? EnsureMonitorRule(process) : null;
                 var app = new MonitoredApp(request, process, DateTimeOffset.Now, desktopId, bounds, rule?.Id);
+                app.WindowHandle = candidate.Handle;
                 app.HasResolvedWindow = true;
+                app.WindowResolved.TrySetResult(true);
                 apps.Add(app);
                 process.Exited += (_, _) => Post(() => RemoveExitedApp(app, process));
+                _ = TrackWindowPlacementAsync(app, desktopId, bounds, GetTopLevelWindowHandles(), applyRestorePlacement: false);
 
                 if (rule is not null)
                 {
@@ -1609,6 +1632,12 @@ internal static partial class Program
                 return;
             }
 
+            Post(() => _ = RestoreSavedSessionAsync());
+        }
+
+        private async Task RestoreSavedSessionAsync()
+        {
+            var completed = false;
             try
             {
                 var session = JsonSerializer.Deserialize<SavedSession>(File.ReadAllText(SessionPath), JsonOptions);
@@ -1617,12 +1646,19 @@ internal static partial class Program
                     return;
                 }
 
+                restoringSession = true;
                 monitorRules.Clear();
                 monitorRules.AddRange(session.Rules ?? []);
+                LogMessage("restore-begin", $"Apps: {session.Apps.Length}; rules: {monitorRules.Count}");
 
                 var restoredRuleBackedCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var savedApp in session.Apps)
                 {
+                    if (IsExiting)
+                    {
+                        break;
+                    }
+
                     if (TryAdoptSavedApp(savedApp))
                     {
                         if (savedApp.RuleId is not null)
@@ -1645,15 +1681,52 @@ internal static partial class Program
                         continue;
                     }
 
-                    Launch(savedApp.ToLaunchRequest(), savedApp.RuleId, applyRestorePlacement: true);
+                    var request = savedApp.ToLaunchRequest();
+                    LogMessage("restore-launch", $"{FormatRequest(request)}; desktop: {savedApp.DesktopId?.ToString() ?? "unknown"}; bounds: {FormatWindowBounds(savedApp.WindowBounds)}");
+                    var app = Launch(request, savedApp.RuleId, applyRestorePlacement: true);
+                    if (app is null)
+                    {
+                        continue;
+                    }
+
+                    await WaitForRestoreLaunchAsync(app);
                 }
 
-                ScanMonitorRules(save: true);
+                ScanMonitorRules(save: false);
+                completed = true;
+                LogMessage("restore-complete", $"Monitored apps: {apps.Count}; rules: {monitorRules.Count}");
             }
             catch (Exception ex)
             {
+                LogException("restore-failed", ex);
                 MessageBox(IntPtr.Zero, ex.Message, "RestartableLaunch restore", 0x10);
             }
+            finally
+            {
+                restoringSession = false;
+                if (completed)
+                {
+                    SaveSession();
+                }
+                else
+                {
+                    SaveActiveState();
+                }
+
+                mainForm.RefreshApps();
+            }
+        }
+
+        private static async Task WaitForRestoreLaunchAsync(MonitoredApp app)
+        {
+            var windowTask = app.WindowResolved.Task;
+            var completedTask = await Task.WhenAny(windowTask, Task.Delay(RestoreLaunchWindowWaitMilliseconds));
+            if (completedTask != windowTask)
+            {
+                LogMessage("restore-window-timeout", FormatRequest(app.Request));
+            }
+
+            await Task.Delay(RestoreLaunchSpacingMilliseconds);
         }
 
         public void ShowMainWindow()
@@ -1774,6 +1847,12 @@ internal static partial class Program
                 var request = savedApp.ToLaunchRequest();
                 if (!MatchesSavedProcess(process, savedApp))
                 {
+                    if (!HasSameSavedStartTime(process, savedApp))
+                    {
+                        process.Dispose();
+                        return false;
+                    }
+
                     var repairedRequest = TryCreateRequestFromProcess(process, requireCommandLine: true);
                     if (repairedRequest is null || !MatchesSavedProcessName(process, savedApp))
                     {
@@ -1814,12 +1893,11 @@ internal static partial class Program
                 {
                     app.WindowHandle = window;
                     app.HasResolvedWindow = true;
+                    app.WindowResolved.TrySetResult(true);
                     UpdateWindowPlacement(app, window, savedApp.DesktopId, savedApp.WindowBounds, save: false);
                 }
-                else
-                {
-                    _ = TrackWindowPlacementAsync(app, savedApp.DesktopId, savedApp.WindowBounds, GetTopLevelWindowHandles(), applyRestorePlacement: false);
-                }
+
+                _ = TrackWindowPlacementAsync(app, savedApp.DesktopId, savedApp.WindowBounds, GetTopLevelWindowHandles(), applyRestorePlacement: false);
 
                 SaveSession();
                 mainForm.RefreshApps();
@@ -1902,7 +1980,8 @@ internal static partial class Program
             var commandLine = TryGetProcessCommandLine(process.Id);
             if (string.IsNullOrWhiteSpace(commandLine))
             {
-                return !string.IsNullOrWhiteSpace(processExecutable);
+                return !string.IsNullOrWhiteSpace(processExecutable)
+                    && (savedApp.Arguments?.Length ?? 0) == 0;
             }
 
             var arguments = CommandLineToArguments(commandLine);
@@ -1942,6 +2021,24 @@ internal static partial class Program
             }
 
             return true;
+        }
+
+        private static bool HasSameSavedStartTime(Process process, SavedApp savedApp)
+        {
+            if (savedApp.StartedAt == default)
+            {
+                return false;
+            }
+
+            try
+            {
+                var delta = (process.StartTime.ToUniversalTime() - savedApp.StartedAt.UtcDateTime).Duration();
+                return delta <= TimeSpan.FromSeconds(2);
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private static bool MatchesSavedProcessName(Process process, SavedApp savedApp)
@@ -2091,6 +2188,7 @@ internal static partial class Program
             {
                 app.WindowHandle = window;
                 app.HasResolvedWindow = true;
+                app.WindowResolved.TrySetResult(true);
             }
 
             apps.Add(app);
@@ -2128,6 +2226,12 @@ internal static partial class Program
         {
             if (IsExiting && !sessionEnding)
             {
+                return;
+            }
+
+            if (restoringSession)
+            {
+                SaveActiveState();
                 return;
             }
 
@@ -2241,6 +2345,12 @@ internal static partial class Program
         {
             var currentDesktopId = VirtualDesktopPlacement.TryGetDesktopId(window) ?? fallbackDesktopId;
             var currentBounds = TryGetWindowBounds(window) ?? fallbackBounds;
+            if (ShouldProtectRestorePlacement(app, currentDesktopId, currentBounds))
+            {
+                currentDesktopId = app.PendingRestoreDesktopId ?? currentDesktopId;
+                currentBounds = app.PendingRestoreWindowBounds ?? currentBounds;
+            }
+
             if (app.DesktopId == currentDesktopId && Equals(app.WindowBounds, currentBounds))
             {
                 return;
@@ -2253,6 +2363,48 @@ internal static partial class Program
                 SaveSession();
                 mainForm.RefreshApps();
             }
+        }
+
+        private static bool ShouldProtectRestorePlacement(MonitoredApp app, Guid? currentDesktopId, WindowBounds? currentBounds)
+        {
+            if (app.PendingRestoreDesktopId is null && app.PendingRestoreWindowBounds is null)
+            {
+                return false;
+            }
+
+            var desktopMatches = app.PendingRestoreDesktopId is null
+                || currentDesktopId == app.PendingRestoreDesktopId;
+            var boundsMatch = app.PendingRestoreWindowBounds is null
+                || IsWindowPlacementClose(currentBounds, app.PendingRestoreWindowBounds);
+            if (desktopMatches && boundsMatch)
+            {
+                app.ClearPendingRestorePlacement();
+                return false;
+            }
+
+            if (DateTimeOffset.UtcNow < app.ProtectRestorePlacementUntil)
+            {
+                return true;
+            }
+
+            LogMessage(
+                "restore-placement-mismatch",
+                $"Keeping observed placement after retry window. Expected: {FormatWindowBounds(app.PendingRestoreWindowBounds)}; observed: {FormatWindowBounds(currentBounds)}; command: {FormatRequest(app.Request)}");
+            app.ClearPendingRestorePlacement();
+            return false;
+        }
+
+        private static bool IsWindowPlacementClose(WindowBounds? actual, WindowBounds expected)
+        {
+            if (actual is null || actual.State != expected.State)
+            {
+                return false;
+            }
+
+            return Math.Abs(actual.Left - expected.Left) <= WindowPlacementTolerancePixels
+                && Math.Abs(actual.Top - expected.Top) <= WindowPlacementTolerancePixels
+                && Math.Abs(actual.Width - expected.Width) <= WindowPlacementTolerancePixels
+                && Math.Abs(actual.Height - expected.Height) <= WindowPlacementTolerancePixels;
         }
 
         private async Task TrackWindowPlacementAsync(
@@ -2268,6 +2420,7 @@ internal static partial class Program
                 var window = await WaitForLaunchWindowAsync(app, existingWindows, IsAlreadyMonitoredProcess, cancellation.Token);
                 if (window == IntPtr.Zero)
                 {
+                    app.WindowResolved.TrySetResult(false);
                     Post(() =>
                     {
                         if (!app.HasResolvedWindow && app.Process.HasExited)
@@ -2299,18 +2452,11 @@ internal static partial class Program
 
                 app.HasResolvedWindow = true;
                 app.WindowHandle = window;
-
-                if (applyRestorePlacement && restoreDesktopId is { } targetDesktopId)
-                {
-                    VirtualDesktopPlacement.TryMoveToDesktop(window, targetDesktopId);
-                }
+                app.WindowResolved.TrySetResult(true);
 
                 if (applyRestorePlacement)
                 {
-                    TryMoveWindow(window, restoreBounds);
-
-                    await Task.Delay(500, cancellation.Token);
-                    TryMoveWindow(window, restoreBounds);
+                    await ApplyRestorePlacementAsync(window, restoreDesktopId, restoreBounds, cancellation.Token);
                 }
 
                 Post(() =>
@@ -2335,7 +2481,30 @@ internal static partial class Program
             }
             catch
             {
+                app.WindowResolved.TrySetResult(false);
                 // Virtual desktop placement uses Windows shell APIs that can fail across builds.
+            }
+        }
+
+        private static async Task ApplyRestorePlacementAsync(
+            IntPtr window,
+            Guid? restoreDesktopId,
+            WindowBounds? restoreBounds,
+            CancellationToken cancellationToken)
+        {
+            foreach (var delay in RestorePlacementRetryDelaysMilliseconds)
+            {
+                if (delay > 0)
+                {
+                    await Task.Delay(delay, cancellationToken);
+                }
+
+                if (restoreDesktopId is { } targetDesktopId)
+                {
+                    VirtualDesktopPlacement.TryMoveToDesktop(window, targetDesktopId);
+                }
+
+                TryMoveWindow(window, restoreBounds);
             }
         }
 
@@ -3013,7 +3182,7 @@ internal static partial class Program
         {
             if (args.Length == 0)
             {
-                return new AppCommand(null, true, CommandMode.ShowGui);
+                return new AppCommand(null, false, CommandMode.ShowGui);
             }
 
             if (Is(args[0], "--restore"))
@@ -3138,6 +3307,21 @@ internal static partial class Program
         public IntPtr WindowHandle { get; set; }
 
         public bool HasResolvedWindow { get; set; }
+
+        public TaskCompletionSource<bool> WindowResolved { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Guid? PendingRestoreDesktopId { get; set; }
+
+        public WindowBounds? PendingRestoreWindowBounds { get; set; }
+
+        public DateTimeOffset ProtectRestorePlacementUntil { get; set; }
+
+        public void ClearPendingRestorePlacement()
+        {
+            PendingRestoreDesktopId = null;
+            PendingRestoreWindowBounds = null;
+            ProtectRestorePlacementUntil = default;
+        }
     }
 
     private enum WindowShowState
