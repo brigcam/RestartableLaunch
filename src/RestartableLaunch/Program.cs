@@ -686,7 +686,7 @@ internal static partial class Program
             try
             {
                 using var process = Process.GetProcessById(processId);
-                candidates.Add(new WindowCandidate(window, processId, process.ProcessName, title));
+                candidates.Add(new WindowCandidate(window, processId, process.ProcessName, title, GetWindowClass(window)));
             }
             catch
             {
@@ -713,6 +713,14 @@ internal static partial class Program
         var builder = new StringBuilder(length + 1);
         GetWindowText(window, builder, builder.Capacity);
         return builder.ToString();
+    }
+
+    private static string GetWindowClass(IntPtr window)
+    {
+        var builder = new StringBuilder(256);
+        return GetClassName(window, builder, builder.Capacity) > 0
+            ? builder.ToString()
+            : string.Empty;
     }
 
     private static Icon TryGetWindowIcon(IntPtr window, int processId)
@@ -1195,6 +1203,10 @@ internal static partial class Program
 
     [LibraryImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool IsWindow(IntPtr hWnd);
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool IsWindowVisible(IntPtr hWnd);
 
     [LibraryImport("user32.dll")]
@@ -1212,6 +1224,9 @@ internal static partial class Program
 
     [LibraryImport("user32.dll", EntryPoint = "GetWindowTextLengthW", StringMarshalling = StringMarshalling.Utf16)]
     private static partial int GetWindowTextLength(IntPtr hWnd);
+
+    [DllImport("user32.dll", EntryPoint = "GetClassNameW", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
 
     [LibraryImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -1418,10 +1433,12 @@ internal static partial class Program
         private readonly MainForm mainForm;
         private readonly List<MonitoredApp> apps = [];
         private readonly List<ProcessMonitorRule> monitorRules = [];
+        private readonly List<SavedApp> pendingPlacementOnlyApps = [];
         private readonly SynchronizationContext uiContext;
         private bool sessionEnding;
         private bool sessionRestored;
         private bool restoringSession;
+        private bool globalPlacementOnly;
 
         public ManagerContext()
         {
@@ -1446,6 +1463,10 @@ internal static partial class Program
         public IReadOnlyList<MonitoredApp> Apps => apps;
 
         public IReadOnlyList<ProcessMonitorRule> MonitorRules => monitorRules;
+
+        public IReadOnlyList<SavedApp> PendingPlacementOnlyApps => pendingPlacementOnlyApps;
+
+        public bool GlobalPlacementOnly => globalPlacementOnly;
 
         public bool IsExiting { get; private set; }
 
@@ -1538,9 +1559,11 @@ internal static partial class Program
                 request = request with { DesktopId = desktopId, WindowBounds = bounds };
 
                 process.EnableRaisingEvents = true;
-                var rule = monitorAllInstances ? EnsureMonitorRule(process) : null;
+                var rule = monitorAllInstances ? EnsureMonitorRule(process, MonitorMode.Restart) : null;
                 var app = new MonitoredApp(request, process, DateTimeOffset.Now, desktopId, bounds, rule?.Id);
                 app.WindowHandle = candidate.Handle;
+                app.WindowTitle = candidate.Title;
+                app.WindowClass = candidate.WindowClass;
                 app.HasResolvedWindow = true;
                 app.WindowResolved.TrySetResult(true);
                 apps.Add(app);
@@ -1570,8 +1593,9 @@ internal static partial class Program
                     return;
                 }
 
-                var rule = EnsureMonitorRule(app.Process);
+                var rule = EnsureMonitorRule(app.Process, MonitorMode.Restart);
                 app.RuleId = rule.Id;
+                app.Mode = MonitorMode.Restart;
                 ScanMonitorRules(save: false);
                 SaveSession();
                 mainForm.RefreshApps();
@@ -1580,6 +1604,74 @@ internal static partial class Program
             {
                 MessageBox(IntPtr.Zero, ex.Message, "RestartableLaunch", 0x10);
             }
+        }
+
+        public void MonitorPlacementOnly(MonitoredApp app)
+        {
+            try
+            {
+                if (app.Process.HasExited)
+                {
+                    return;
+                }
+
+                var rule = EnsureMonitorRule(app.Process, MonitorMode.PlacementOnly);
+                app.RuleId = rule.Id;
+                app.Mode = MonitorMode.PlacementOnly;
+                SaveSession();
+                mainForm.RefreshApps();
+            }
+            catch (Exception ex)
+            {
+                MessageBox(IntPtr.Zero, ex.Message, "RestartableLaunch", 0x10);
+            }
+        }
+
+        public void AdoptWindowPlacementOnly(WindowCandidate candidate)
+        {
+            try
+            {
+                var existingApp = apps.FirstOrDefault(app => app.WindowHandle == candidate.Handle);
+                if (existingApp is not null)
+                {
+                    MonitorPlacementOnly(existingApp);
+                    return;
+                }
+
+                var process = Process.GetProcessById(candidate.ProcessId);
+                var rule = EnsureMonitorRule(process, MonitorMode.PlacementOnly);
+                if (!TryAdoptPlacementWindow(process, candidate.Handle, rule.Id, pendingSnapshot: null))
+                {
+                    process.Dispose();
+                    MessageBox(IntPtr.Zero, "Could not read a command line for that window.", "RestartableLaunch", 0x10);
+                    return;
+                }
+
+                ScanMonitorRules(save: false);
+                SaveSession();
+                mainForm.RefreshApps();
+            }
+            catch (Exception ex)
+            {
+                MessageBox(IntPtr.Zero, ex.Message, "RestartableLaunch", 0x10);
+            }
+        }
+
+        public void SetGlobalPlacementOnly(bool enabled)
+        {
+            if (globalPlacementOnly == enabled)
+            {
+                return;
+            }
+
+            globalPlacementOnly = enabled;
+            if (enabled)
+            {
+                ScanMonitorRules(save: false);
+            }
+
+            SaveSession();
+            mainForm.RefreshApps();
         }
 
         public void RemoveItems(IEnumerable<object> selectedItems)
@@ -1592,9 +1684,15 @@ internal static partial class Program
                 .ToHashSet();
 
             var removed = false;
+            foreach (var snapshot in items.OfType<SavedApp>().ToArray())
+            {
+                removed |= pendingPlacementOnlyApps.Remove(snapshot);
+            }
+
             if (ruleIdsToRemove.Count > 0)
             {
                 removed |= monitorRules.RemoveAll(rule => ruleIdsToRemove.Contains(rule.Id)) > 0;
+                removed |= pendingPlacementOnlyApps.RemoveAll(snapshot => ruleIdsToRemove.Contains(snapshot.RuleId ?? Guid.Empty)) > 0;
             }
 
             var appsToRemove = apps
@@ -1648,8 +1746,10 @@ internal static partial class Program
 
                 restoringSession = true;
                 monitorRules.Clear();
+                pendingPlacementOnlyApps.Clear();
                 monitorRules.AddRange(session.Rules ?? []);
-                LogMessage("restore-begin", $"Apps: {session.Apps.Length}; rules: {monitorRules.Count}");
+                globalPlacementOnly = session.GlobalPlacementOnly;
+                LogMessage("restore-begin", $"Apps: {session.Apps.Length}; rules: {monitorRules.Count}; global placement-only: {globalPlacementOnly}");
 
                 var restoredRuleBackedCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var savedApp in session.Apps)
@@ -1657,6 +1757,12 @@ internal static partial class Program
                     if (IsExiting)
                     {
                         break;
+                    }
+
+                    if (savedApp.Mode == MonitorMode.PlacementOnly)
+                    {
+                        pendingPlacementOnlyApps.Add(savedApp);
+                        continue;
                     }
 
                     if (TryAdoptSavedApp(savedApp))
@@ -1813,6 +1919,17 @@ internal static partial class Program
             mainForm.RefreshApps();
         }
 
+        private void AddPendingPlacementSnapshot(SavedApp snapshot)
+        {
+            if (snapshot.Mode != MonitorMode.PlacementOnly)
+            {
+                snapshot = snapshot with { Mode = MonitorMode.PlacementOnly };
+            }
+
+            pendingPlacementOnlyApps.RemoveAll(existing => HaveSamePlacementIdentity(existing, snapshot));
+            pendingPlacementOnlyApps.Add(snapshot);
+        }
+
         private void RemoveExitedApp(MonitoredApp app, Process exitedProcess)
         {
             if (sessionEnding)
@@ -1823,6 +1940,11 @@ internal static partial class Program
             if (!ReferenceEquals(app.Process, exitedProcess) || !app.HasResolvedWindow)
             {
                 return;
+            }
+
+            if (app.Mode == MonitorMode.PlacementOnly)
+            {
+                AddPendingPlacementSnapshot(SavedApp.FromMonitoredApp(app));
             }
 
             Remove(app);
@@ -1883,7 +2005,12 @@ internal static partial class Program
                     startedAt,
                     savedApp.DesktopId,
                     savedApp.WindowBounds,
-                    savedApp.RuleId);
+                    savedApp.RuleId,
+                    savedApp.Mode)
+                {
+                    WindowTitle = savedApp.WindowTitle ?? string.Empty,
+                    WindowClass = savedApp.WindowClass ?? string.Empty,
+                };
 
                 apps.Add(app);
                 process.Exited += (_, _) => Post(() => RemoveExitedApp(app, process));
@@ -2043,7 +2170,9 @@ internal static partial class Program
 
         private static bool MatchesSavedProcessName(Process process, SavedApp savedApp)
         {
-            var expectedProcessName = Path.GetFileNameWithoutExtension(savedApp.Executable);
+            var expectedProcessName = !string.IsNullOrWhiteSpace(savedApp.ProcessName)
+                ? savedApp.ProcessName
+                : Path.GetFileNameWithoutExtension(savedApp.Executable);
             return string.IsNullOrWhiteSpace(expectedProcessName)
                 || string.Equals(process.ProcessName, expectedProcessName, StringComparison.OrdinalIgnoreCase);
         }
@@ -2053,17 +2182,17 @@ internal static partial class Program
             return apps.Any(app => !app.Process.HasExited && app.Process.Id == processId);
         }
 
-        private ProcessMonitorRule EnsureMonitorRule(Process process)
+        private ProcessMonitorRule EnsureMonitorRule(Process process, MonitorMode mode)
         {
             var executablePath = TryGetProcessExecutablePath(process);
             var processName = process.ProcessName;
-            var existingRule = monitorRules.FirstOrDefault(rule => MatchesRuleIdentity(rule, executablePath, processName));
+            var existingRule = monitorRules.FirstOrDefault(rule => rule.Mode == mode && MatchesRuleIdentity(rule, executablePath, processName));
             if (existingRule is not null)
             {
                 return existingRule;
             }
 
-            var rule = new ProcessMonitorRule(Guid.NewGuid(), executablePath, processName);
+            var rule = new ProcessMonitorRule(Guid.NewGuid(), executablePath, processName, mode);
             monitorRules.Add(rule);
             return rule;
         }
@@ -2118,7 +2247,7 @@ internal static partial class Program
 
         private void ScanMonitorRules(bool save)
         {
-            if (monitorRules.Count == 0)
+            if (monitorRules.Count == 0 && !globalPlacementOnly && pendingPlacementOnlyApps.Count == 0)
             {
                 return;
             }
@@ -2126,6 +2255,11 @@ internal static partial class Program
             var added = false;
             foreach (var rule in monitorRules.ToArray())
             {
+                if (rule.Mode != MonitorMode.Restart)
+                {
+                    continue;
+                }
+
                 foreach (var process in Process.GetProcesses())
                 {
                     try
@@ -2152,11 +2286,81 @@ internal static partial class Program
                 }
             }
 
+            added |= ScanPlacementOnlyWindows();
+
             if (added && save)
             {
                 SaveSession();
                 mainForm.RefreshApps();
             }
+        }
+
+        private bool ScanPlacementOnlyWindows()
+        {
+            var placementRules = monitorRules.Where(static rule => rule.Mode == MonitorMode.PlacementOnly).ToArray();
+            if (placementRules.Length == 0 && !globalPlacementOnly && pendingPlacementOnlyApps.Count == 0)
+            {
+                return false;
+            }
+
+            var added = false;
+            var shellWindow = GetShellWindow();
+            EnumWindows((window, _) =>
+            {
+                if (window == shellWindow
+                    || !IsWindowVisible(window)
+                    || apps.Any(app => app.WindowHandle == window))
+                {
+                    return true;
+                }
+
+                var title = GetWindowTitle(window);
+                if (string.IsNullOrWhiteSpace(title))
+                {
+                    return true;
+                }
+
+                GetWindowThreadProcessId(window, out var processId);
+                if (processId <= 0 || processId == Environment.ProcessId)
+                {
+                    return true;
+                }
+
+                Process? process = null;
+                try
+                {
+                    process = Process.GetProcessById(processId);
+                    if (process.HasExited)
+                    {
+                        return true;
+                    }
+
+                    var rule = placementRules.FirstOrDefault(rule => MatchesMonitorRule(process, rule));
+                    var pendingSnapshot = TryTakePendingPlacementSnapshot(process, window, title);
+                    if (rule is null && pendingSnapshot is null && !globalPlacementOnly)
+                    {
+                        return true;
+                    }
+
+                    if (TryAdoptPlacementWindow(process, window, rule?.Id ?? pendingSnapshot?.RuleId, pendingSnapshot))
+                    {
+                        process = null;
+                        added = true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogException("placement-scan-window", ex);
+                }
+                finally
+                {
+                    process?.Dispose();
+                }
+
+                return true;
+            }, IntPtr.Zero);
+
+            return added;
         }
 
         private bool TryAdoptProcess(Process process, Guid? ruleId)
@@ -2187,6 +2391,8 @@ internal static partial class Program
             if (window != IntPtr.Zero)
             {
                 app.WindowHandle = window;
+                app.WindowTitle = GetWindowTitle(window);
+                app.WindowClass = GetWindowClass(window);
                 app.HasResolvedWindow = true;
                 app.WindowResolved.TrySetResult(true);
             }
@@ -2195,6 +2401,219 @@ internal static partial class Program
             process.Exited += (_, _) => Post(() => RemoveExitedApp(app, process));
             _ = TrackWindowPlacementAsync(app, desktopId, bounds, GetTopLevelWindowHandles(), applyRestorePlacement: false);
             return true;
+        }
+
+        private bool TryAdoptPlacementWindow(Process process, IntPtr window, Guid? ruleId, SavedApp? pendingSnapshot)
+        {
+            if (apps.Any(app => app.WindowHandle == window))
+            {
+                return false;
+            }
+
+            var request = TryCreateRequestFromProcess(process);
+            if (request is null)
+            {
+                return false;
+            }
+
+            var desktopId = VirtualDesktopPlacement.TryGetDesktopId(window);
+            var bounds = TryGetWindowBounds(window);
+            var title = GetWindowTitle(window);
+            var windowClass = GetWindowClass(window);
+            request = request with { DesktopId = desktopId, WindowBounds = bounds };
+
+            process.EnableRaisingEvents = true;
+            var app = new MonitoredApp(
+                request,
+                process,
+                TryGetProcessStartedAt(process) ?? DateTimeOffset.Now,
+                pendingSnapshot?.DesktopId ?? desktopId,
+                pendingSnapshot?.WindowBounds ?? bounds,
+                ruleId,
+                MonitorMode.PlacementOnly)
+            {
+                WindowHandle = window,
+                WindowTitle = title,
+                WindowClass = windowClass,
+                HasResolvedWindow = true,
+            };
+            app.WindowResolved.TrySetResult(true);
+
+            if (pendingSnapshot is not null)
+            {
+                app.PendingRestoreDesktopId = pendingSnapshot.DesktopId;
+                app.PendingRestoreWindowBounds = pendingSnapshot.WindowBounds;
+                app.ProtectRestorePlacementUntil = DateTimeOffset.UtcNow.AddMilliseconds(RestorePlacementProtectionMilliseconds);
+            }
+
+            apps.Add(app);
+            if (pendingSnapshot is not null)
+            {
+                pendingPlacementOnlyApps.Remove(pendingSnapshot);
+            }
+
+            process.Exited += (_, _) => Post(() => RemoveExitedApp(app, process));
+            _ = TrackWindowPlacementAsync(
+                app,
+                pendingSnapshot?.DesktopId ?? desktopId,
+                pendingSnapshot?.WindowBounds ?? bounds,
+                GetTopLevelWindowHandles(),
+                applyRestorePlacement: pendingSnapshot is not null);
+            return true;
+        }
+
+        private SavedApp? TryTakePendingPlacementSnapshot(Process process, IntPtr window, string title)
+        {
+            if (pendingPlacementOnlyApps.Count == 0)
+            {
+                return null;
+            }
+
+            var windowClass = GetWindowClass(window);
+            var candidates = pendingPlacementOnlyApps
+                .Where(snapshot => MatchesPlacementProcess(process, snapshot)
+                    && MatchesPlacementWindowClass(snapshot, windowClass))
+                .ToArray();
+            if (candidates.Length == 0)
+            {
+                return null;
+            }
+
+            var titleMatches = candidates
+                .Where(snapshot => MatchesPlacementWindowTitle(snapshot, title))
+                .ToArray();
+            if (titleMatches.Length == 1)
+            {
+                if (CountOpenPlacementCandidates(process, windowClass, title) == 1)
+                {
+                    return titleMatches[0];
+                }
+
+                LogMessage("placement-match-ambiguous", $"Multiple open title matches for {process.ProcessName}: {title}");
+                return null;
+            }
+
+            if (titleMatches.Length > 1)
+            {
+                LogMessage("placement-match-ambiguous", $"Multiple title matches for {process.ProcessName}: {title}");
+                return null;
+            }
+
+            if (candidates.Length == 1 && CountOpenPlacementCandidates(process, windowClass, title: null) == 1)
+            {
+                return candidates[0];
+            }
+
+            LogMessage("placement-match-ambiguous", $"Ambiguous placement candidates for {process.ProcessName}: {title}; candidates: {candidates.Length}");
+            return null;
+        }
+
+        private static bool MatchesPlacementProcess(Process process, SavedApp snapshot)
+        {
+            var expectedProcessName = !string.IsNullOrWhiteSpace(snapshot.ProcessName)
+                ? snapshot.ProcessName
+                : Path.GetFileNameWithoutExtension(snapshot.Executable);
+            if (!string.IsNullOrWhiteSpace(expectedProcessName)
+                && !string.Equals(process.ProcessName, expectedProcessName, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var expectedPath = snapshot.Executable;
+            var actualPath = TryGetProcessExecutablePath(process);
+            if (string.IsNullOrWhiteSpace(expectedPath)
+                || string.IsNullOrWhiteSpace(actualPath)
+                || !Path.IsPathFullyQualified(expectedPath))
+            {
+                return true;
+            }
+
+            return string.Equals(
+                NormalizeRestartKeyPart(expectedPath),
+                NormalizeRestartKeyPart(actualPath),
+                StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool MatchesPlacementWindowClass(SavedApp snapshot, string windowClass)
+        {
+            return string.IsNullOrWhiteSpace(snapshot.WindowClass)
+                || string.IsNullOrWhiteSpace(windowClass)
+                || string.Equals(snapshot.WindowClass, windowClass, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool MatchesPlacementWindowTitle(SavedApp snapshot, string title)
+        {
+            return !string.IsNullOrWhiteSpace(snapshot.WindowTitle)
+                && string.Equals(snapshot.WindowTitle.Trim(), title.Trim(), StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool HaveSamePlacementIdentity(SavedApp left, SavedApp right)
+        {
+            return string.Equals(NormalizeRestartKeyPart(left.Executable), NormalizeRestartKeyPart(right.Executable), StringComparison.OrdinalIgnoreCase)
+                && string.Equals(left.ProcessName ?? string.Empty, right.ProcessName ?? string.Empty, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(left.WindowClass ?? string.Empty, right.WindowClass ?? string.Empty, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(left.WindowTitle ?? string.Empty, right.WindowTitle ?? string.Empty, StringComparison.OrdinalIgnoreCase)
+                && left.RuleId == right.RuleId;
+        }
+
+        private int CountOpenPlacementCandidates(Process referenceProcess, string windowClass, string? title)
+        {
+            var count = 0;
+            var shellWindow = GetShellWindow();
+            EnumWindows((window, _) =>
+            {
+                if (window == shellWindow || !IsWindowVisible(window) || apps.Any(app => app.WindowHandle == window))
+                {
+                    return true;
+                }
+
+                if (!string.Equals(GetWindowClass(window), windowClass, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+
+                if (title is not null && !string.Equals(GetWindowTitle(window), title, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+
+                GetWindowThreadProcessId(window, out var processId);
+                if (processId <= 0)
+                {
+                    return true;
+                }
+
+                try
+                {
+                    using var process = Process.GetProcessById(processId);
+                    if (MatchesSameProcessIdentity(referenceProcess, process))
+                    {
+                        count++;
+                    }
+                }
+                catch
+                {
+                    // Ignore racing windows.
+                }
+
+                return count <= 1;
+            }, IntPtr.Zero);
+
+            return count;
+        }
+
+        private static bool MatchesSameProcessIdentity(Process left, Process right)
+        {
+            if (!string.Equals(left.ProcessName, right.ProcessName, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var leftPath = TryGetProcessExecutablePath(left);
+            var rightPath = TryGetProcessExecutablePath(right);
+            return string.IsNullOrWhiteSpace(leftPath)
+                || string.IsNullOrWhiteSpace(rightPath)
+                || string.Equals(leftPath, rightPath, StringComparison.OrdinalIgnoreCase);
         }
 
         private static bool MatchesMonitorRule(Process process, ProcessMonitorRule rule)
@@ -2235,7 +2654,11 @@ internal static partial class Program
                 return;
             }
 
-            var session = new SavedSession(apps.Select(static app => SavedApp.FromMonitoredApp(app)).ToArray(), monitorRules.ToArray());
+            var savedApps = apps
+                .Select(static app => SavedApp.FromMonitoredApp(app))
+                .Concat(pendingPlacementOnlyApps)
+                .ToArray();
+            var session = new SavedSession(savedApps, monitorRules.ToArray(), globalPlacementOnly);
             File.WriteAllText(SessionPath, JsonSerializer.Serialize(session, JsonOptions));
             SaveActiveState();
         }
@@ -2277,9 +2700,11 @@ internal static partial class Program
                     .AppendLine($"Process: {SafeGetProcessName(app.Process)}")
                     .AppendLine($"Has exited: {SafeHasExited(app.Process)}")
                     .AppendLine($"Started: {app.StartedAt:O}")
-                    .AppendLine($"Mode: {(app.RuleId is null ? "Single" : "All instances")}")
+                    .AppendLine($"Mode: {app.Mode}")
                     .AppendLine($"RuleId: {app.RuleId?.ToString("D") ?? "(none)"}")
                     .AppendLine($"WindowHandle: 0x{app.WindowHandle.ToInt64():X}")
+                    .AppendLine($"WindowTitle: {app.WindowTitle}")
+                    .AppendLine($"WindowClass: {app.WindowClass}")
                     .AppendLine($"HasResolvedWindow: {app.HasResolvedWindow}")
                     .AppendLine($"DesktopId: {app.DesktopId?.ToString() ?? "unknown"}")
                     .AppendLine($"WindowBounds: {FormatWindowBounds(app.WindowBounds)}")
@@ -2291,7 +2716,7 @@ internal static partial class Program
                 builder.AppendLine().AppendLine("Rules:");
                 foreach (var rule in monitorRules.ToArray())
                 {
-                    builder.AppendLine($"- {rule.ProcessName}: {rule.ExecutablePath} ({rule.Id:D})");
+                    builder.AppendLine($"- {rule.ProcessName}: {rule.ExecutablePath} ({rule.Mode}, {rule.Id:D})");
                 }
             }
 
@@ -2345,6 +2770,8 @@ internal static partial class Program
         {
             var currentDesktopId = VirtualDesktopPlacement.TryGetDesktopId(window) ?? fallbackDesktopId;
             var currentBounds = TryGetWindowBounds(window) ?? fallbackBounds;
+            app.WindowTitle = GetWindowTitle(window);
+            app.WindowClass = GetWindowClass(window);
             if (ShouldProtectRestorePlacement(app, currentDesktopId, currentBounds))
             {
                 currentDesktopId = app.PendingRestoreDesktopId ?? currentDesktopId;
@@ -2417,7 +2844,9 @@ internal static partial class Program
             try
             {
                 using var cancellation = new CancellationTokenSource(WindowWaitTimeoutMilliseconds + 5000);
-                var window = await WaitForLaunchWindowAsync(app, existingWindows, IsAlreadyMonitoredProcess, cancellation.Token);
+                var window = app.WindowHandle != IntPtr.Zero
+                    ? app.WindowHandle
+                    : await WaitForLaunchWindowAsync(app, existingWindows, IsAlreadyMonitoredProcess, cancellation.Token);
                 if (window == IntPtr.Zero)
                 {
                     app.WindowResolved.TrySetResult(false);
@@ -2474,6 +2903,13 @@ internal static partial class Program
                     {
                         if (apps.Contains(app) && !app.Process.HasExited)
                         {
+                            if (app.Mode == MonitorMode.PlacementOnly && (window == IntPtr.Zero || !IsWindow(window) || !IsWindowVisible(window)))
+                            {
+                                AddPendingPlacementSnapshot(SavedApp.FromMonitoredApp(app));
+                                Remove(app);
+                                return;
+                            }
+
                             UpdateWindowPlacement(app, window, app.DesktopId, app.WindowBounds, save: true);
                         }
                     });
@@ -2537,10 +2973,12 @@ internal static partial class Program
         private readonly Button removeButton = new();
         private readonly CheckBox startupCheckBox = new();
         private readonly CheckBox explorerMenuCheckBox = new();
+        private readonly CheckBox globalPlacementCheckBox = new();
         private readonly StatusStrip statusStrip = new();
         private readonly ToolStripStatusLabel statusLabel = new();
         private bool updatingStartupCheckBox;
         private bool updatingExplorerMenuCheckBox;
+        private bool updatingGlobalPlacementCheckBox;
 
         public MainForm(ManagerContext context)
         {
@@ -2556,7 +2994,7 @@ internal static partial class Program
             var topPanel = new Panel
             {
                 Dock = DockStyle.Top,
-                Height = 88,
+                Height = 112,
                 Padding = new Padding(16, 12, 16, 10),
                 BackColor = Color.White,
             };
@@ -2573,11 +3011,17 @@ internal static partial class Program
             explorerMenuCheckBox.CheckedChanged += (_, _) => ToggleExplorerContextMenu();
             topPanel.Controls.Add(explorerMenuCheckBox);
 
+            globalPlacementCheckBox.AutoSize = true;
+            globalPlacementCheckBox.Text = "Keep placement for self-restoring windows";
+            globalPlacementCheckBox.Location = new Point(16, 68);
+            globalPlacementCheckBox.CheckedChanged += (_, _) => ToggleGlobalPlacementOnly();
+            topPanel.Controls.Add(globalPlacementCheckBox);
+
             addWindowButton.Text = "+ Add Window";
             addWindowButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             addWindowButton.Size = new Size(124, 34);
             addWindowButton.FlatStyle = FlatStyle.System;
-            addWindowButton.Location = new Point(topPanel.Width - addWindowButton.Width - 16, 26);
+            addWindowButton.Location = new Point(topPanel.Width - addWindowButton.Width - 16, 39);
             addWindowButton.Click += (_, _) => AddOpenWindow();
             topPanel.Controls.Add(addWindowButton);
 
@@ -2590,10 +3034,10 @@ internal static partial class Program
             topPanel.Controls.Add(removeButton);
             topPanel.Resize += (_, _) =>
             {
-                addWindowButton.Location = new Point(topPanel.ClientSize.Width - addWindowButton.Width - 16, 26);
-                removeButton.Location = new Point(addWindowButton.Left - removeButton.Width - 10, 26);
+                addWindowButton.Location = new Point(topPanel.ClientSize.Width - addWindowButton.Width - 16, 39);
+                removeButton.Location = new Point(addWindowButton.Left - removeButton.Width - 10, 39);
             };
-            removeButton.Location = new Point(addWindowButton.Left - removeButton.Width - 10, 26);
+            removeButton.Location = new Point(addWindowButton.Left - removeButton.Width - 10, 39);
 
             listView.Dock = DockStyle.Fill;
             listView.BorderStyle = BorderStyle.None;
@@ -2645,8 +3089,9 @@ internal static partial class Program
             rulesView.HideSelection = false;
             rulesView.SmallImageList = ruleIcons;
             rulesView.Columns.Add(string.Empty, 34);
-            rulesView.Columns.Add("Process", 180);
-            rulesView.Columns.Add("Executable", 726);
+            rulesView.Columns.Add("Process", 160);
+            rulesView.Columns.Add("Mode", 120);
+            rulesView.Columns.Add("Executable", 626);
             rulesView.SelectedIndexChanged += (_, _) => UpdateRemoveButtonState();
             rulesView.ColumnClick += (_, e) => SortListByColumn(rulesView, e.Column);
             rulesView.KeyDown += (_, e) =>
@@ -2678,10 +3123,12 @@ internal static partial class Program
 
             RefreshStartupState();
             RefreshExplorerContextMenuState();
+            RefreshGlobalPlacementState();
         }
 
         public void RefreshApps()
         {
+            RefreshGlobalPlacementState();
             var nextAppIcons = CreateSmallIconList();
             var appItems = new List<ListViewItem>();
 
@@ -2700,11 +3147,37 @@ internal static partial class Program
                 };
                 item.SubItems.Add(app.Process.ProcessName);
                 item.SubItems.Add(app.Process.Id.ToString());
-                item.SubItems.Add(app.RuleId is null ? "Single" : "All instances");
+                item.SubItems.Add(FormatMonitorMode(app));
                 item.SubItems.Add(app.StartedAt.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss"));
                 item.SubItems.Add(FormatRequest(app.Request));
                 item.SubItems.Add(app.DesktopId?.ToString() ?? "unknown");
                 item.Tag = app;
+                appItems.Add(item);
+            }
+
+            foreach (var snapshot in context.PendingPlacementOnlyApps)
+            {
+                var processName = !string.IsNullOrWhiteSpace(snapshot.ProcessName)
+                    ? snapshot.ProcessName
+                    : Path.GetFileNameWithoutExtension(snapshot.Executable);
+                var imageKey = $"pending-{snapshot.GetHashCode()}";
+                var imageIndex = nextAppIcons.Images.Count;
+                using (var icon = TryGetRuleIcon(new ProcessMonitorRule(Guid.Empty, snapshot.Executable, processName, MonitorMode.PlacementOnly)))
+                {
+                    AddIconImage(nextAppIcons, imageKey, icon);
+                }
+
+                var item = new ListViewItem(string.Empty)
+                {
+                    ImageIndex = imageIndex,
+                };
+                item.SubItems.Add(processName);
+                item.SubItems.Add("pending");
+                item.SubItems.Add("Placement pending");
+                item.SubItems.Add(snapshot.StartedAt == default ? string.Empty : snapshot.StartedAt.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss"));
+                item.SubItems.Add(FormatRequest(snapshot.ToLaunchRequest()));
+                item.SubItems.Add(snapshot.DesktopId?.ToString() ?? "unknown");
+                item.Tag = snapshot;
                 appItems.Add(item);
             }
 
@@ -2724,6 +3197,7 @@ internal static partial class Program
                     ImageIndex = imageIndex,
                 };
                 item.SubItems.Add(rule.ProcessName);
+                item.SubItems.Add(rule.Mode == MonitorMode.PlacementOnly ? "Placement only" : "Restart");
                 item.SubItems.Add(string.IsNullOrWhiteSpace(rule.ExecutablePath) ? "(process name only)" : rule.ExecutablePath);
                 item.Tag = rule;
                 ruleItems.Add(item);
@@ -2756,9 +3230,17 @@ internal static partial class Program
             }
 
             UpdateRemoveButtonState();
-            statusLabel.Text = context.Apps.Count == 1
+            var totalApps = context.Apps.Count + context.PendingPlacementOnlyApps.Count;
+            statusLabel.Text = totalApps == 1
                 ? $"1 monitored app, {context.MonitorRules.Count} watch rules"
-                : $"{context.Apps.Count} monitored apps, {context.MonitorRules.Count} watch rules";
+                : $"{totalApps} monitored apps, {context.MonitorRules.Count} watch rules";
+        }
+
+        private static string FormatMonitorMode(MonitoredApp app)
+        {
+            return app.Mode == MonitorMode.PlacementOnly
+                ? "Placement only"
+                : app.RuleId is null ? "Restart" : "All instances";
         }
 
         private void SortListByColumn(int column)
@@ -2793,6 +3275,7 @@ internal static partial class Program
             var menu = new ContextMenuStrip();
             var bringToFrontItem = new ToolStripMenuItem("Bring to front");
             var monitorAllItem = new ToolStripMenuItem();
+            var placementOnlyItem = new ToolStripMenuItem();
             var separator = new ToolStripSeparator();
             menu.Opening += (_, e) =>
             {
@@ -2805,10 +3288,14 @@ internal static partial class Program
                 var selectedApp = GetSelectedMonitoredApp();
                 bringToFrontItem.Visible = selectedApp is not null;
                 monitorAllItem.Visible = selectedApp is not null && selectedApp.RuleId is null;
+                placementOnlyItem.Visible = selectedApp is not null && selectedApp.Mode != MonitorMode.PlacementOnly;
                 separator.Visible = selectedApp is not null;
                 monitorAllItem.Text = selectedApp is null
                     ? "Monitor all instances"
                     : $"Monitor all instances of {selectedApp.Process.ProcessName}.exe";
+                placementOnlyItem.Text = selectedApp is null
+                    ? "Keep placement only"
+                    : $"Keep placement only for all instances of {selectedApp.Process.ProcessName}.exe";
             };
             bringToFrontItem.Click += (_, _) => BringSelectedMonitoredAppToFront();
             monitorAllItem.Click += (_, _) =>
@@ -2818,8 +3305,16 @@ internal static partial class Program
                     context.MonitorAllInstances(app);
                 }
             };
+            placementOnlyItem.Click += (_, _) =>
+            {
+                if (GetSelectedMonitoredApp() is { } app)
+                {
+                    context.MonitorPlacementOnly(app);
+                }
+            };
             menu.Items.Add(bringToFrontItem);
             menu.Items.Add(monitorAllItem);
+            menu.Items.Add(placementOnlyItem);
             menu.Items.Add(separator);
             menu.Items.Add("Remove", null, (_, _) => RemoveSelectedApps());
             return menu;
@@ -2910,12 +3405,32 @@ internal static partial class Program
             }
         }
 
+        private void RefreshGlobalPlacementState()
+        {
+            updatingGlobalPlacementCheckBox = true;
+            try
+            {
+                globalPlacementCheckBox.Checked = context.GlobalPlacementOnly;
+            }
+            finally
+            {
+                updatingGlobalPlacementCheckBox = false;
+            }
+        }
+
         private void AddOpenWindow()
         {
             using var dialog = new WindowPickerForm();
             if (dialog.ShowDialog(this) == DialogResult.OK && dialog.SelectedWindow is { } selectedWindow)
             {
-                context.AdoptWindow(selectedWindow, dialog.MonitorAllInstances);
+                if (dialog.PlacementOnly)
+                {
+                    context.AdoptWindowPlacementOnly(selectedWindow);
+                }
+                else
+                {
+                    context.AdoptWindow(selectedWindow, dialog.MonitorAllInstances);
+                }
             }
         }
 
@@ -2986,6 +3501,16 @@ internal static partial class Program
             {
                 RefreshExplorerContextMenuState();
             }
+        }
+
+        private void ToggleGlobalPlacementOnly()
+        {
+            if (updatingGlobalPlacementCheckBox)
+            {
+                return;
+            }
+
+            context.SetGlobalPlacementOnly(globalPlacementCheckBox.Checked);
         }
     }
 
@@ -3089,10 +3614,13 @@ internal static partial class Program
 
         public bool MonitorAllInstances => monitorAllInstancesCheckBox.Checked;
 
+        public bool PlacementOnly { get; private set; }
+
         private ContextMenuStrip BuildContextMenu()
         {
             var menu = new ContextMenuStrip();
             var monitorAllItem = new ToolStripMenuItem();
+            var placementOnlyItem = new ToolStripMenuItem();
             menu.Opening += (_, e) =>
             {
                 e.Cancel = listView.SelectedItems.Count == 0;
@@ -3105,6 +3633,9 @@ internal static partial class Program
                 monitorAllItem.Text = candidate is null
                     ? "Monitor all instances"
                     : $"Monitor all instances of {candidate.ProcessName}.exe";
+                placementOnlyItem.Text = candidate is null
+                    ? "Keep placement only"
+                    : $"Keep placement only for all instances of {candidate.ProcessName}.exe";
             };
 
             monitorAllItem.Click += (_, _) =>
@@ -3118,7 +3649,19 @@ internal static partial class Program
                 AcceptSelection();
             };
 
+            placementOnlyItem.Click += (_, _) =>
+            {
+                if (GetSelectedCandidate() is null)
+                {
+                    return;
+                }
+
+                PlacementOnly = true;
+                AcceptSelection();
+            };
+
             menu.Items.Add(monitorAllItem);
+            menu.Items.Add(placementOnlyItem);
             return menu;
         }
 
@@ -3253,7 +3796,7 @@ internal static partial class Program
 
     private sealed record LaunchRequest(string Executable, string[] Arguments, Guid? DesktopId, LaunchKind Kind, WindowBounds? WindowBounds);
 
-    private sealed record SavedSession(SavedApp[] Apps, ProcessMonitorRule[]? Rules = null);
+    private sealed record SavedSession(SavedApp[] Apps, ProcessMonitorRule[]? Rules = null, bool GlobalPlacementOnly = false);
 
     private sealed record SavedApp(
         int ProcessId,
@@ -3263,7 +3806,11 @@ internal static partial class Program
         Guid? DesktopId,
         LaunchKind Kind,
         WindowBounds? WindowBounds,
-        Guid? RuleId = null)
+        Guid? RuleId = null,
+        MonitorMode Mode = MonitorMode.Restart,
+        string? ProcessName = null,
+        string? WindowTitle = null,
+        string? WindowClass = null)
     {
         public static SavedApp FromMonitoredApp(MonitoredApp app)
         {
@@ -3275,7 +3822,11 @@ internal static partial class Program
                 app.DesktopId,
                 app.Request.Kind,
                 app.WindowBounds,
-                app.RuleId);
+                app.RuleId,
+                app.Mode,
+                TryGetProcessName(app.Process),
+                app.WindowTitle,
+                app.WindowClass);
         }
 
         public LaunchRequest ToLaunchRequest()
@@ -3288,9 +3839,15 @@ internal static partial class Program
 
     private sealed record ActiveAppState(int ProcessId, DateTimeOffset StartedAt, LaunchRequest Request, Guid? DesktopId, WindowBounds? WindowBounds);
 
-    private sealed record ProcessMonitorRule(Guid Id, string ExecutablePath, string ProcessName);
+    private enum MonitorMode
+    {
+        Restart,
+        PlacementOnly,
+    }
 
-    private sealed class MonitoredApp(LaunchRequest request, Process process, DateTimeOffset startedAt, Guid? desktopId, WindowBounds? windowBounds, Guid? ruleId)
+    private sealed record ProcessMonitorRule(Guid Id, string ExecutablePath, string ProcessName, MonitorMode Mode = MonitorMode.Restart);
+
+    private sealed class MonitoredApp(LaunchRequest request, Process process, DateTimeOffset startedAt, Guid? desktopId, WindowBounds? windowBounds, Guid? ruleId, MonitorMode mode = MonitorMode.Restart)
     {
         public LaunchRequest Request { get; set; } = request;
 
@@ -3304,7 +3861,13 @@ internal static partial class Program
 
         public Guid? RuleId { get; set; } = ruleId;
 
+        public MonitorMode Mode { get; set; } = mode;
+
         public IntPtr WindowHandle { get; set; }
+
+        public string WindowTitle { get; set; } = string.Empty;
+
+        public string WindowClass { get; set; } = string.Empty;
 
         public bool HasResolvedWindow { get; set; }
 
@@ -3333,5 +3896,5 @@ internal static partial class Program
 
     private sealed record WindowBounds(int Left, int Top, int Width, int Height, WindowShowState State = WindowShowState.Normal);
 
-    private sealed record WindowCandidate(IntPtr Handle, int ProcessId, string ProcessName, string Title);
+    private sealed record WindowCandidate(IntPtr Handle, int ProcessId, string ProcessName, string Title, string WindowClass);
 }
